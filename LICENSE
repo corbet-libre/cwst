@@ -1,0 +1,5 @@
+Copyright 2026 Julian Y. Richard Corbet
+SPDX-License-Identifier: LGPL-3.0-only WITH LGPL-3.0-linking-exception
+
+src/veilid_crypt.rs is derived from Veilid (Copyright the Veilid Team)
+SPDX-License-Identifier: MPL-2.0
