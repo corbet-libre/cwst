@@ -575,7 +575,34 @@ fn native_process_kill_preserves_whole_checkpoint() {
 test_async!(aggregate_checkpoint_bound_across_commits, {
     let mut store = Store::create(Memory::new(), &cipher(1), "s").await.unwrap();
     let value = vec![1; cwst::MAX_VALUE_BYTES];
-    store.commit(0, [1; 32], &[Change::Put { owner: "a", key: b"a", value: &value }], &[]).await.unwrap();
-    assert_eq!(store.commit(1, [2; 32], &[Change::Put { owner: "b", key: b"b", value: &value }], &[]).await.unwrap_err(), Error::TooLarge);
+    store
+        .commit(
+            0,
+            [1; 32],
+            &[Change::Put {
+                owner: "a",
+                key: b"a",
+                value: &value,
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .commit(
+                1,
+                [2; 32],
+                &[Change::Put {
+                    owner: "b",
+                    key: b"b",
+                    value: &value
+                }],
+                &[]
+            )
+            .await
+            .unwrap_err(),
+        Error::TooLarge
+    );
     assert_eq!(store.version().unwrap(), 1);
 });

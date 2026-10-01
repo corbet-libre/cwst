@@ -81,10 +81,18 @@ impl<B: Backend> std::fmt::Debug for Store<B> {
 impl<B: Backend> Store<B> {
     /// Explicitly create an empty checkpoint. Does not overwrite existing storage.
     pub async fn create(backend: B, cipher: &StoreCipher, scope: &str) -> Result<Self, Error> {
+        Self::create_with_entropy(backend, cipher, scope, &mut ckmg::SystemEntropy).await
+    }
+    async fn create_with_entropy(
+        backend: B,
+        cipher: &StoreCipher,
+        scope: &str,
+        entropy: &mut impl ckmg::Entropy,
+    ) -> Result<Self, Error> {
         let context = context(scope)?;
-        let key = veilid_crypt::random_secret()?;
+        let key = veilid_crypt::random_secret(entropy)?;
         let wrapped = cipher
-            .seal(&mut ckmg::SystemEntropy, &context, key.as_slice())
+            .seal(entropy, &context, key.as_slice())
             .map_err(|_| Error::Crypto)?;
         let checkpoint = Checkpoint {
             version: 0,
@@ -239,6 +247,10 @@ impl<B: Backend> Store<B> {
     }
     /// Wipe decrypted state. The backend remains independently reopenable.
     pub fn lock(mut self) {
+        self.lock_in_place();
+    }
+    /// Wipe a shared checkpoint without consuming its synchronization container.
+    pub fn lock_in_place(&mut self) {
         self.open = None;
     }
     fn current(&self) -> Result<&Open, Error> {

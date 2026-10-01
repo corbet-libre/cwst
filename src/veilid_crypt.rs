@@ -26,6 +26,8 @@
 // - 2026-10-01: protected tier moved to ckmg StoreCipher, removing password/Argon2;
 // - 2026-10-01: whole-checkpoint encryption uses random nonces and scoped AAD;
 //   deterministic lookup encryption was removed because names now stay inside it.
+// - 2026-10-01: bound plaintext and inject the established Entropy port for failure vectors;
+//   fixed-size key/nonce construction removes impossible length-conversion errors.
 
 //! Veilid data-tier AEAD composition; protected-key wrapping belongs to ckmg.
 
@@ -38,16 +40,28 @@ use zeroize::Zeroizing;
 
 pub(crate) type Secret = Zeroizing<[u8; 32]>;
 
-pub(crate) fn random_secret() -> Result<Secret, Error> {
+pub(crate) fn random_secret(entropy: &mut impl ckmg::Entropy) -> Result<Secret, Error> {
     let mut key = Zeroizing::new([0; 32]);
-    getrandom::fill(key.as_mut()).map_err(|_| Error::Randomness)?;
+    entropy.fill(key.as_mut()).map_err(|_| Error::Randomness)?;
     Ok(key)
 }
 
 pub(crate) fn encrypt(data: &[u8], key: &Secret, aad: &[u8]) -> Result<Vec<u8>, Error> {
+    encrypt_with_entropy(data, key, aad, &mut ckmg::SystemEntropy)
+}
+
+pub(crate) fn encrypt_with_entropy(
+    data: &[u8],
+    key: &Secret,
+    aad: &[u8],
+    entropy: &mut impl ckmg::Entropy,
+) -> Result<Vec<u8>, Error> {
+    if data.len() > crate::MAX_CHECKPOINT_BYTES {
+        return Err(Error::TooLarge);
+    }
     let mut nonce = [0; 24];
-    getrandom::fill(&mut nonce).map_err(|_| Error::Randomness)?;
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice()).map_err(|_| Error::Crypto)?;
+    entropy.fill(&mut nonce).map_err(|_| Error::Randomness)?;
+    let cipher = XChaCha20Poly1305::new(&(**key).into());
     let encrypted = cipher
         .encrypt(&XNonce::from(nonce), Payload { msg: data, aad })
         .map_err(|_| Error::Crypto)?;
@@ -60,8 +74,9 @@ pub(crate) fn decrypt(data: &[u8], key: &Secret, aad: &[u8]) -> Result<Zeroizing
     if data.len() < 40 {
         return Err(Error::Corrupt);
     }
-    let nonce: [u8; 24] = data[..24].try_into().map_err(|_| Error::Corrupt)?;
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice()).map_err(|_| Error::Crypto)?;
+    let mut nonce = [0; 24];
+    nonce.copy_from_slice(&data[..24]);
+    let cipher = XChaCha20Poly1305::new(&(**key).into());
     cipher
         .decrypt(
             &XNonce::from(nonce),

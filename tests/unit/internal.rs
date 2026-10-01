@@ -77,3 +77,45 @@ fn authenticated_checkpoint_invariants() {
         );
     });
 }
+
+struct FailAfter(usize);
+impl ckmg::Entropy for FailAfter {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), ckmg::Error> {
+        if self.0 == 0 {
+            return Err(ckmg::Error::Randomness);
+        }
+        self.0 -= 1;
+        ckmg::Entropy::fill(&mut ckmg::SystemEntropy, out)
+    }
+}
+#[test]
+fn entropy_failures_refuse_creation_and_data_encryption() {
+    futures_executor::block_on(async {
+        let cipher = store_cipher(&PrfOutput::from_bytes(&[4; 32]).unwrap(), "test").unwrap();
+        for successful_calls in 0..2 {
+            let backend = Memory::new();
+            assert!(
+                Store::create_with_entropy(
+                    backend.clone(),
+                    &cipher,
+                    "test",
+                    &mut FailAfter(successful_calls)
+                )
+                .await
+                .is_err()
+            );
+            assert!(backend.read().await.unwrap().is_none());
+        }
+        let key = Zeroizing::new([0; 32]);
+        assert_eq!(
+            veilid_crypt::encrypt_with_entropy(b"plain", &key, b"scope", &mut FailAfter(0))
+                .unwrap_err(),
+            Error::Randomness
+        );
+        assert_eq!(
+            veilid_crypt::encrypt(&vec![0; crate::MAX_CHECKPOINT_BYTES + 1], &key, b"scope")
+                .unwrap_err(),
+            Error::TooLarge
+        );
+    });
+}
