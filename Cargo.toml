@@ -3,7 +3,7 @@ name = "cwst"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Web store: encrypted key-value drawers over keyvaluedb-web, unlocked by a caller-supplied secret"
+description = "Encrypted atomic device checkpoints with durable outbox and writer fencing"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception AND MPL-2.0"
 repository = "https://github.com/corbet-foss/cwst"
 readme = "README.md"
@@ -12,6 +12,8 @@ include = [
     "Cargo.toml",
     "src/**",
     "tests/**",
+    "browser/**",
+    "docs/**",
     "README.md",
     "LICENSE",
     "LICENSE.md",
@@ -19,32 +21,38 @@ include = [
 ]
 
 [lib]
-crate-type = ["rlib"]
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-# The versions Veilid pins (keyvaluedb 0.2.4) and the crypto crates Veilid's VLD0 uses.
-keyvaluedb = "=0.2.4"
-keyvaluedb-memorydb = "=0.2.4"
-argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+# Veilid-compatible storage and cryptographic composition.
+keyvaluedb = "0.2.4"
+keyvaluedb-memorydb = "0.2.4"
 blake3 = "1.8"
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 getrandom = "0.4"
-zeroize = "1.8"
+zeroize = { version = "1.8", features = ["derive"] }
+ckmg = { git = "https://github.com/corbet-foss/ckmg", branch = "main" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-keyvaluedb-web = "=0.2.4"
+keyvaluedb-web = "0.2.4"
 getrandom = { version = "0.4", features = ["wasm_js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+atomicwrites = "0.4"
+fs2 = "0.4"
 
 [dev-dependencies]
 futures-executor = "0.3"
+wasm-bindgen-test = "0.3"
 
-# Argon2 is deliberately slow; unoptimised test builds would take seconds per unlock.
-[profile.test.package.argon2]
-opt-level = 3
-[profile.dev.package.argon2]
-opt-level = 3
-[profile.dev.package.blake2]
-opt-level = 3
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

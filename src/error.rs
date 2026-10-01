@@ -1,55 +1,36 @@
 use std::fmt;
 
-/// Store errors. Deliberately coarse: they never carry keys, values or names.
+/// Coarse errors never carry identifiers, data, paths or upstream messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Error {
-    /// `create` found an existing store.
+    /// Creation found a checkpoint.
     AlreadyInitialized,
-    /// `unlock` found no store.
+    /// No checkpoint exists; this is distinct from unavailable storage.
     NotInitialized,
-    /// Wrong password, or the protected key was modified.
+    /// Wrapped key could not be opened.
     Unlock,
-    /// Stored data failed to decrypt or has the wrong shape.
+    /// Ciphertext or serialized data is invalid.
     Corrupt,
-    /// The protected key uses a cryptosystem other than VLD0.
-    UnsupportedKind,
-    /// Empty or oversized password.
-    InvalidPassword,
-    /// Empty or oversized namespace name.
-    InvalidName,
-    /// Empty or oversized key.
-    InvalidKey,
-    /// Oversized value.
+    /// Invalid scope, identifier or transaction shape.
+    Invalid,
+    /// Resource bound exceeded.
     TooLarge,
-    /// The namespace does not exist.
-    UnknownNamespace,
-    /// The backing database failed.
+    /// A concurrent writer won; reopen and reconcile before retrying.
+    Conflict,
+    /// A write may have committed; reopen and inspect the operation identifier.
+    Uncertain,
+    /// Storage could not be read or opened.
     Storage,
-    /// The platform random number generator failed.
+    /// No unlocked checkpoint; a cancelled commit also enters this state.
+    Locked,
+    /// Randomness unavailable.
     Randomness,
-    /// A cryptographic operation failed unexpectedly.
+    /// Cryptographic operation failed.
     Crypto,
 }
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Error::AlreadyInitialized => "store already initialized",
-            Error::NotInitialized => "store not initialized",
-            Error::Unlock => "store unlock failed",
-            Error::Corrupt => "stored data is corrupt",
-            Error::UnsupportedKind => "unsupported cryptosystem",
-            Error::InvalidPassword => "invalid password",
-            Error::InvalidName => "invalid namespace name",
-            Error::InvalidKey => "invalid key",
-            Error::TooLarge => "value too large",
-            Error::UnknownNamespace => "unknown namespace",
-            Error::Storage => "storage failure",
-            Error::Randomness => "randomness unavailable",
-            Error::Crypto => "cryptographic failure",
-        })
+        write!(f, "storage: {self:?}")
     }
 }
-
 impl std::error::Error for Error {}

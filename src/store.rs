@@ -1,544 +1,342 @@
-//! The store: protected device key, wrapped namespace keys, encrypted entries.
-//!
-//! Layout of the backing database (two columns):
-//!
-//! | Column | Key | Value |
-//! |---|---|---|
-//! | meta | `cwst.dek` | protected device encryption key (Veilid format) |
-//! | meta | `cwst.index` | index key, encrypted under the DEK |
-//! | meta | `cwst.ns:` + tag | namespace key and name, encrypted under the DEK |
-//! | data | tag + encrypted key | encrypted value |
-//!
-//! The tag is a keyed hash of the namespace name (16 bytes), so neither names nor keys
-//! are visible in storage. The database does reveal how many entries each namespace has
-//! and their sizes; callers that must hide sizes pad before storing.
+//! One atomic publication chain; every owner remains opaque.
+use crate::{
+    Error, MAX_KEY_BYTES, MAX_OUTPUTS, MAX_RECORDS, MAX_VALUE_BYTES,
+    backend::{Backend, check_size},
+    veilid_crypt::{self, Secret},
+};
+use ckmg::passkey::StoreCipher;
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::veilid_crypt::{self, SHARED_SECRET_LENGTH, Secret};
-use crate::{Error, MAX_KEY_BYTES, MAX_NAME_BYTES, MAX_VALUE_BYTES};
-use keyvaluedb::{DBTransaction, KeyValueDB};
-use zeroize::Zeroizing;
+const HEADER: &[u8] = b"cwst.checkpoint.v2\0";
+const WRAPPED_BYTES: usize = 72;
 
-const META: u32 = 0;
-const DATA: u32 = 1;
-
-const DEK_KEY: &[u8] = b"cwst.dek";
-const INDEX_KEY: &[u8] = b"cwst.index";
-const NAMESPACE_PREFIX: &[u8] = b"cwst.ns:";
-const TAG_LENGTH: usize = 16;
-
-const AAD_INDEX: &[u8] = b"cwst.index.v1";
-const AAD_NAMESPACE: &[u8] = b"cwst.namespace.v1";
-const AAD_KEY: &[u8] = b"cwst.key.v1";
-const AAD_VALUE: &[u8] = b"cwst.value.v1";
-const TAG_CONTEXT: &[u8] = b"cwst.namespace-tag.v1";
-
-type Tag = [u8; TAG_LENGTH];
-
-/// One write in an atomic [`Namespace::write`] batch.
-#[derive(Clone, Copy)]
-pub enum Op<'a> {
-    /// Insert or replace `key` with `value`.
+/// One owner mutation, applied with all other changes and outputs in the same commit.
+pub enum Change<'a> {
+    /// Replace an opaque record.
     Put {
-        /// Plaintext key.
+        /// Domain owner, scoped by the enclosing vault.
+        owner: &'a str,
+        /// Owner-local record key.
         key: &'a [u8],
-        /// Plaintext value.
+        /// Opaque record bytes.
         value: &'a [u8],
     },
-    /// Remove `key` if present.
+    /// Remove a record; this does not remove the checkpoint's fencing state.
     Delete {
-        /// Plaintext key.
+        /// Domain owner.
+        owner: &'a str,
+        /// Owner-local key.
         key: &'a [u8],
     },
 }
-
-impl std::fmt::Debug for Op<'_> {
+/// Durable output, replayed unchanged until explicitly acknowledged.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+pub struct Output {
+    /// Opaque caller-assigned idempotency identifier.
+    pub id: [u8; 32],
+    /// Opaque payload; storage does not decide how it is published.
+    pub bytes: Vec<u8>,
+}
+impl std::fmt::Debug for Output {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Op::Put { .. } => "Op::Put([redacted])",
-            Op::Delete { .. } => "Op::Delete([redacted])",
-        })
+        f.write_str("Output([redacted])")
     }
 }
-
-/// An unlocked store. The device encryption key lives only in this value (wiped on
-/// drop) and never leaves the crate.
-pub struct WebStore<D: KeyValueDB> {
-    db: D,
-    dek: Secret,
-    index: Secret,
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    owner: String,
+    key: Vec<u8>,
+    value: Vec<u8>,
 }
-
-impl<D: KeyValueDB> std::fmt::Debug for WebStore<D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("WebStore([redacted])")
-    }
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+struct Checkpoint {
+    version: u64,
+    operation: [u8; 32],
+    records: Vec<Record>,
+    pending: Vec<Output>,
 }
-
-struct NamespaceEntry {
+struct Open {
     key: Secret,
-    name: String,
+    wrapped: Vec<u8>,
+    wire: Vec<u8>,
+    checkpoint: Checkpoint,
 }
 
-impl<D: KeyValueDB> WebStore<D> {
-    /// Whether `db` already holds a store.
-    pub async fn is_initialized(db: &D) -> Result<bool, Error> {
-        Ok(db
-            .get(META, DEK_KEY)
-            .await
-            .map_err(|_| Error::Storage)?
-            .is_some())
+/// An unlocked, scope-bound checkpoint. Lock consumes it and drops zeroizing secrets.
+/// After any attempted write, a conflict/error/cancellation leaves this handle locked.
+pub struct Store<B: Backend> {
+    backend: B,
+    context: Vec<u8>,
+    open: Option<Open>,
+}
+impl<B: Backend> std::fmt::Debug for Store<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Store([redacted])")
     }
-
-    /// Create a new store in an empty database, protected by `password`.
-    ///
-    /// Only one vault instance may own a database: the check for an existing store and
-    /// the first write are not atomic across concurrent callers.
-    pub async fn create(db: D, password: &[u8]) -> Result<Self, Error> {
-        if Self::is_initialized(&db).await? {
-            return Err(Error::AlreadyInitialized);
-        }
-        let dek = veilid_crypt::random_secret()?;
-        let index = veilid_crypt::random_secret()?;
-        let mut tx = DBTransaction::new();
-        tx.put_owned(
-            META,
-            DEK_KEY.to_vec(),
-            veilid_crypt::protect_device_encryption_key(&dek, password)?,
-        );
-        tx.put_owned(
-            META,
-            INDEX_KEY.to_vec(),
-            veilid_crypt::encrypt(index.as_slice(), &dek, false, AAD_INDEX)?,
-        );
-        write(&db, tx).await?;
-        Ok(Self { db, dek, index })
-    }
-
-    /// Unlock an existing store with `password`.
-    pub async fn unlock(db: D, password: &[u8]) -> Result<Self, Error> {
-        let protected = db
-            .get(META, DEK_KEY)
-            .await
-            .map_err(|_| Error::Storage)?
-            .ok_or(Error::NotInitialized)?;
-        let dek = veilid_crypt::unprotect_device_encryption_key(&protected, password)?;
-        let wrapped_index = db
-            .get(META, INDEX_KEY)
-            .await
-            .map_err(|_| Error::Storage)?
-            .ok_or(Error::Corrupt)?;
-        let index = to_secret(&veilid_crypt::decrypt(&wrapped_index, &dek, AAD_INDEX)?)?;
-        Ok(Self { db, dek, index })
-    }
-
-    /// Protect the device encryption key with a new password. Nothing else is
-    /// re-encrypted; the old password stops working once this returns.
-    pub async fn change_password(&self, new_password: &[u8]) -> Result<(), Error> {
-        let mut tx = DBTransaction::new();
-        tx.put_owned(
-            META,
-            DEK_KEY.to_vec(),
-            veilid_crypt::protect_device_encryption_key(&self.dek, new_password)?,
-        );
-        write(&self.db, tx).await
-    }
-
-    /// Replace the device encryption key and protect the new one with `password`.
-    /// Re-wraps the index key and every namespace key in one transaction; entries are
-    /// untouched.
-    pub async fn rotate_device_key(&mut self, password: &[u8]) -> Result<(), Error> {
-        let new_dek = veilid_crypt::random_secret()?;
-        let mut tx = DBTransaction::new();
-        tx.put_owned(
-            META,
-            DEK_KEY.to_vec(),
-            veilid_crypt::protect_device_encryption_key(&new_dek, password)?,
-        );
-        tx.put_owned(
-            META,
-            INDEX_KEY.to_vec(),
-            veilid_crypt::encrypt(self.index.as_slice(), &new_dek, false, AAD_INDEX)?,
-        );
-        for (tag, entry) in self.namespace_entries().await? {
-            tx.put_owned(
-                META,
-                namespace_meta_key(&tag),
-                seal_namespace(&new_dek, &tag, &entry)?,
-            );
-        }
-        write(&self.db, tx).await?;
-        self.dek = new_dek;
-        Ok(())
-    }
-
-    /// Open the namespace `name`, creating it if it does not exist.
-    pub async fn namespace(&self, name: &str) -> Result<Namespace<'_, D>, Error> {
-        match self.existing_namespace(name).await {
-            Err(Error::UnknownNamespace) => {}
-            other => return other,
-        }
-        let tag = self.tag(name);
-        let entry = NamespaceEntry {
-            key: veilid_crypt::random_secret()?,
-            name: name.to_owned(),
+}
+impl<B: Backend> Store<B> {
+    /// Explicitly create an empty checkpoint. Does not overwrite existing storage.
+    pub async fn create(backend: B, cipher: &StoreCipher, scope: &str) -> Result<Self, Error> {
+        let context = context(scope)?;
+        let key = veilid_crypt::random_secret()?;
+        let wrapped = cipher
+            .seal(&mut ckmg::SystemEntropy, &context, key.as_slice())
+            .map_err(|_| Error::Crypto)?;
+        let checkpoint = Checkpoint {
+            version: 0,
+            operation: [0; 32],
+            records: vec![],
+            pending: vec![],
         };
-        let mut tx = DBTransaction::new();
-        tx.put_owned(
-            META,
-            namespace_meta_key(&tag),
-            seal_namespace(&self.dek, &tag, &entry)?,
-        );
-        write(&self.db, tx).await?;
-        Ok(Namespace {
-            store: self,
-            tag,
-            key: entry.key,
+        let wire = encode(&checkpoint, &key, &wrapped, &context)?;
+        match backend.compare_exchange(None, &wire).await {
+            Err(Error::Conflict) => return Err(Error::AlreadyInitialized),
+            result => result?,
+        }
+        Ok(Self {
+            backend,
+            context,
+            open: Some(Open {
+                key,
+                wrapped,
+                wire,
+                checkpoint,
+            }),
         })
     }
-
-    /// Open the namespace `name`; [`Error::UnknownNamespace`] if it does not exist.
-    pub async fn existing_namespace(&self, name: &str) -> Result<Namespace<'_, D>, Error> {
-        let tag = self.tag(name);
-        let entry = self.load_namespace(name, &tag).await?;
-        Ok(Namespace {
-            store: self,
-            tag,
-            key: entry.key,
-        })
-    }
-
-    /// Names of all namespaces, sorted.
-    pub async fn namespaces(&self) -> Result<Vec<String>, Error> {
-        let mut names: Vec<String> = self
-            .namespace_entries()
-            .await?
-            .into_iter()
-            .map(|(_, entry)| entry.name)
-            .collect();
-        names.sort();
-        Ok(names)
-    }
-
-    /// Give the namespace a new key and re-encrypt all of its entries in one
-    /// transaction. Afterwards the old namespace key decrypts nothing that is stored.
-    pub async fn rotate_namespace_key(&mut self, name: &str) -> Result<(), Error> {
-        let tag = self.tag(name);
-        let old = self.load_namespace(name, &tag).await?;
-        let new = NamespaceEntry {
-            key: veilid_crypt::random_secret()?,
-            name: old.name.clone(),
-        };
-        let mut tx = DBTransaction::new();
-        for (stored_key, stored_value) in raw_entries(&self.db, DATA, &tag).await? {
-            let key = open_key(&old.key, &tag, &stored_key)?;
-            let value = open_value(&old.key, &stored_key, &stored_value)?;
-            let new_stored_key = seal_key(&new.key, &tag, &key)?;
-            let new_stored_value = seal_value(&new.key, &new_stored_key, &value)?;
-            tx.delete_owned(DATA, stored_key);
-            tx.put_owned(DATA, new_stored_key, new_stored_value);
-        }
-        tx.put_owned(
-            META,
-            namespace_meta_key(&tag),
-            seal_namespace(&self.dek, &tag, &new)?,
-        );
-        write(&self.db, tx).await
-    }
-
-    /// Crypto-shred the namespace: delete its wrapped key and all of its entries.
-    /// Returns whether it existed. Opening it again creates a new, empty namespace.
-    pub async fn shred_namespace(&mut self, name: &str) -> Result<bool, Error> {
-        let tag = self.tag(name);
-        match self.load_namespace(name, &tag).await {
-            Ok(_) => {}
-            Err(Error::UnknownNamespace) => return Ok(false),
-            Err(error) => return Err(error),
-        }
-        let mut tx = DBTransaction::new();
-        tx.delete_owned(META, namespace_meta_key(&tag));
-        tx.delete_prefix(DATA, tag);
-        write(&self.db, tx).await?;
-        Ok(true)
-    }
-
-    /// Crypto-shred the whole store: the protected device key, all wrapped keys and all
-    /// entries. The database is left empty and uninitialized.
-    pub async fn shred(self) -> Result<(), Error> {
-        let mut tx = DBTransaction::new();
-        tx.delete_prefix(META, b"");
-        tx.delete_prefix(DATA, b"");
-        write(&self.db, tx).await
-    }
-
-    fn tag(&self, name: &str) -> Tag {
-        let mut input = Vec::with_capacity(TAG_CONTEXT.len() + name.len());
-        input.extend_from_slice(TAG_CONTEXT);
-        input.extend_from_slice(name.as_bytes());
-        let hash = blake3::keyed_hash(&self.index, &input);
-        let mut tag = [0u8; TAG_LENGTH];
-        tag.copy_from_slice(&hash.as_bytes()[..TAG_LENGTH]);
-        tag
-    }
-
-    async fn load_namespace(&self, name: &str, tag: &Tag) -> Result<NamespaceEntry, Error> {
-        validate_name(name)?;
-        let meta_key = namespace_meta_key(tag);
-        let sealed = self
-            .db
-            .get(META, &meta_key)
-            .await
-            .map_err(|_| Error::Storage)?
-            .ok_or(Error::UnknownNamespace)?;
-        let entry = open_namespace(&self.dek, tag, &sealed)?;
-        if entry.name != name {
+    /// Open an existing checkpoint. Wrong scope/key and corruption never create state.
+    pub async fn open(backend: B, cipher: &StoreCipher, scope: &str) -> Result<Self, Error> {
+        let context = context(scope)?;
+        let wire = backend.read().await?.ok_or(Error::NotInitialized)?;
+        check_size(&wire)?;
+        if !wire.starts_with(HEADER) || wire.len() < HEADER.len() + WRAPPED_BYTES + 40 {
             return Err(Error::Corrupt);
         }
-        Ok(entry)
+        let wrapped = wire[HEADER.len()..HEADER.len() + WRAPPED_BYTES].to_vec();
+        let secret = cipher.open(&context, &wrapped).map_err(|_| Error::Unlock)?;
+        let key: [u8; 32] = secret.as_slice().try_into().map_err(|_| Error::Corrupt)?;
+        let key = Zeroizing::new(key);
+        let plaintext = veilid_crypt::decrypt(
+            &wire[HEADER.len() + WRAPPED_BYTES..],
+            &key,
+            &aad(&context, &wrapped),
+        )?;
+        let checkpoint: Checkpoint =
+            serde_json::from_slice(&plaintext).map_err(|_| Error::Corrupt)?;
+        validate(&checkpoint)?;
+        Ok(Self {
+            backend,
+            context,
+            open: Some(Open {
+                key,
+                wrapped,
+                wire,
+                checkpoint,
+            }),
+        })
     }
-
-    async fn namespace_entries(&self) -> Result<Vec<(Tag, NamespaceEntry)>, Error> {
-        let mut out = Vec::new();
-        for (meta_key, sealed) in raw_entries(&self.db, META, NAMESPACE_PREFIX).await? {
-            let tag: Tag = meta_key[NAMESPACE_PREFIX.len()..]
-                .try_into()
-                .map_err(|_| Error::Corrupt)?;
-            let entry = open_namespace(&self.dek, &tag, &sealed)?;
-            out.push((tag, entry));
-        }
-        Ok(out)
+    /// Check the scope selected when this checkpoint was authenticated. A new,
+    /// empty checkpoint has the same binding; owner loaders must check it too.
+    pub fn is_scope(&self, scope: &str) -> bool {
+        self.context.strip_prefix(HEADER) == Some(scope.as_bytes())
     }
-}
-
-/// An open namespace (drawer). Borrows the store, so it cannot outlive a key rotation
-/// or a shred.
-pub struct Namespace<'s, D: KeyValueDB> {
-    store: &'s WebStore<D>,
-    tag: Tag,
-    key: Secret,
-}
-
-impl<D: KeyValueDB> std::fmt::Debug for Namespace<'_, D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Namespace([redacted])")
+    /// Current committed version; compare this at every publication boundary.
+    pub fn version(&self) -> Result<u64, Error> {
+        Ok(self.current()?.checkpoint.version)
     }
-}
-
-impl<D: KeyValueDB> Namespace<'_, D> {
-    /// Read the value stored under `key`.
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
-        validate_key(key)?;
-        let stored_key = seal_key(&self.key, &self.tag, key)?;
-        match self
-            .store
-            .db
-            .get(DATA, &stored_key)
-            .await
-            .map_err(|_| Error::Storage)?
-        {
-            None => Ok(None),
-            Some(stored_value) => Ok(Some(open_value(&self.key, &stored_key, &stored_value)?)),
-        }
+    /// Last committed operation, for unknown-outcome reconciliation; zero means initial creation.
+    pub fn operation(&self) -> Result<[u8; 32], Error> {
+        Ok(self.current()?.checkpoint.operation)
     }
-
-    /// Store `value` under `key`.
-    pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        self.write(&[Op::Put { key, value }]).await
-    }
-
-    /// Delete `key`. Returns whether it existed.
-    pub async fn delete(&self, key: &[u8]) -> Result<bool, Error> {
-        validate_key(key)?;
-        let stored_key = seal_key(&self.key, &self.tag, key)?;
+    /// Read a domain-owned record from this committed snapshot.
+    pub fn read(&self, owner: &str, key: &[u8]) -> Result<Option<&[u8]>, Error> {
+        identifier(owner, key)?;
         Ok(self
-            .store
-            .db
-            .delete(DATA, &stored_key)
-            .await
-            .map_err(|_| Error::Storage)?
-            .is_some())
+            .current()?
+            .checkpoint
+            .records
+            .iter()
+            .find(|r| r.owner == owner && r.key == key)
+            .map(|r| r.value.as_slice()))
     }
-
-    /// Apply several puts and deletes atomically.
-    pub async fn write(&self, ops: &[Op<'_>]) -> Result<(), Error> {
-        let mut tx = DBTransaction::with_capacity(ops.len());
-        for op in ops {
-            match *op {
-                Op::Put { key, value } => {
-                    validate_key(key)?;
-                    if value.len() > MAX_VALUE_BYTES {
-                        return Err(Error::TooLarge);
-                    }
-                    let stored_key = seal_key(&self.key, &self.tag, key)?;
-                    let stored_value = seal_value(&self.key, &stored_key, value)?;
-                    tx.put_owned(DATA, stored_key, stored_value);
-                }
-                Op::Delete { key } => {
-                    validate_key(key)?;
-                    tx.delete_owned(DATA, seal_key(&self.key, &self.tag, key)?);
-                }
+    /// Outputs are available only from a committed snapshot; retransmit the same bytes.
+    pub fn load_pending(&self) -> Result<&[Output], Error> {
+        Ok(&self.current()?.checkpoint.pending)
+    }
+    /// Commit several domain owners and their pending outputs under one version fence.
+    pub async fn commit(
+        &mut self,
+        expected: u64,
+        operation: [u8; 32],
+        changes: &[Change<'_>],
+        outputs: &[Output],
+    ) -> Result<u64, Error> {
+        self.expect(expected)?;
+        if changes.len() > MAX_RECORDS || outputs.len() > MAX_OUTPUTS || operation == [0; 32] {
+            return Err(Error::Invalid);
+        }
+        // Bound caller-owned input before cloning values into a candidate.
+        let input_bytes = changes.iter().try_fold(0usize, |total, change| {
+            let amount = match change {
+                Change::Put { owner, key, value } => owner
+                    .len()
+                    .checked_add(key.len())
+                    .and_then(|n| n.checked_add(value.len())),
+                Change::Delete { owner, key } => owner.len().checked_add(key.len()),
+            }
+            .ok_or(Error::TooLarge)?;
+            total.checked_add(amount).ok_or(Error::TooLarge)
+        })?;
+        let input_bytes = outputs.iter().try_fold(input_bytes, |total, output| {
+            total.checked_add(output.bytes.len()).ok_or(Error::TooLarge)
+        })?;
+        if input_bytes > crate::MAX_CHECKPOINT_BYTES / 4 {
+            return Err(Error::TooLarge);
+        }
+        let mut candidate = self.current()?.checkpoint.clone();
+        for change in changes {
+            let (owner, key) = match change {
+                Change::Put { owner, key, .. } | Change::Delete { owner, key } => (*owner, *key),
+            };
+            identifier(owner, key)?;
+            if let Change::Put { value, .. } = change
+                && value.len() > MAX_VALUE_BYTES
+            {
+                return Err(Error::TooLarge);
+            }
+            candidate
+                .records
+                .retain(|r| r.owner != owner || r.key != key);
+            if let Change::Put { value, .. } = change {
+                candidate.records.push(Record {
+                    owner: owner.into(),
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                });
             }
         }
-        write(&self.store.db, tx).await
+        candidate.pending.extend_from_slice(outputs);
+        self.save(candidate, operation).await
     }
-
-    /// All keys in this namespace (in storage order, which is not key order).
-    pub async fn keys(&self) -> Result<Vec<Vec<u8>>, Error> {
-        let tag = self.tag;
-        let (stored, _) = self
-            .store
-            .db
-            .iter_keys(
-                DATA,
-                Some(&tag[..]),
-                Vec::new(),
-                |acc: &mut Vec<Vec<u8>>, key| {
-                    acc.push(key.clone());
-                    Ok(None::<()>)
-                },
-            )
-            .await
-            .map_err(|_| Error::Storage)?;
-        stored
-            .iter()
-            .map(|stored_key| open_key(&self.key, &self.tag, stored_key).map(|k| k.to_vec()))
-            .collect()
+    /// Acknowledge one exact output after its idempotent publication.
+    pub async fn ack_output(
+        &mut self,
+        expected: u64,
+        operation: [u8; 32],
+        id: [u8; 32],
+    ) -> Result<u64, Error> {
+        self.expect(expected)?;
+        let mut candidate = self.current()?.checkpoint.clone();
+        if !candidate.pending.iter().any(|o| o.id == id) || operation == [0; 32] {
+            return Err(Error::Invalid);
+        }
+        candidate.pending.retain(|o| o.id != id);
+        self.save(candidate, operation).await
     }
-
-    /// All entries in this namespace.
-    pub async fn entries(&self) -> Result<Vec<(Vec<u8>, Zeroizing<Vec<u8>>)>, Error> {
-        raw_entries(&self.store.db, DATA, &self.tag)
-            .await?
-            .into_iter()
-            .map(|(stored_key, stored_value)| {
-                Ok((
-                    open_key(&self.key, &self.tag, &stored_key)?.to_vec(),
-                    open_value(&self.key, &stored_key, &stored_value)?,
-                ))
-            })
-            .collect()
+    /// Wipe decrypted state. The backend remains independently reopenable.
+    pub fn lock(mut self) {
+        self.open = None;
     }
-
-    /// Delete every entry in this namespace, keeping the namespace and its key.
-    pub async fn clear(&self) -> Result<(), Error> {
-        let mut tx = DBTransaction::new();
-        tx.delete_prefix(DATA, self.tag);
-        write(&self.store.db, tx).await
+    fn current(&self) -> Result<&Open, Error> {
+        self.open.as_ref().ok_or(Error::Locked)
+    }
+    fn expect(&self, expected: u64) -> Result<(), Error> {
+        if self.version()? != expected {
+            Err(Error::Conflict)
+        } else {
+            Ok(())
+        }
+    }
+    async fn save(&mut self, mut candidate: Checkpoint, operation: [u8; 32]) -> Result<u64, Error> {
+        candidate.version = candidate.version.checked_add(1).ok_or(Error::TooLarge)?;
+        candidate.operation = operation;
+        validate(&candidate)?;
+        let current = self.current()?;
+        let wire = encode(&candidate, &current.key, &current.wrapped, &self.context)?;
+        // Remove decrypted state before yielding: cancellation cannot reuse stale authority.
+        let old = self.open.take().ok_or(Error::Locked)?;
+        self.backend
+            .compare_exchange(Some(&old.wire), &wire)
+            .await?;
+        let version = candidate.version;
+        self.open = Some(Open {
+            key: old.key,
+            wrapped: old.wrapped,
+            wire,
+            checkpoint: candidate,
+        });
+        Ok(version)
     }
 }
-
-async fn write<D: KeyValueDB>(db: &D, tx: DBTransaction) -> Result<(), Error> {
-    db.write(tx).await.map_err(|_| Error::Storage)
+fn context(scope: &str) -> Result<Vec<u8>, Error> {
+    identifier(scope, b"scope")?;
+    Ok([HEADER, scope.as_bytes()].concat())
 }
-
-async fn raw_entries<D: KeyValueDB>(
-    db: &D,
-    col: u32,
-    prefix: &[u8],
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
-    let (entries, _) = db
-        .iter(
-            col,
-            Some(prefix),
-            Vec::new(),
-            |acc: &mut Vec<(Vec<u8>, Vec<u8>)>, (key, value)| {
-                acc.push((key.clone(), value.clone()));
-                Ok(None::<()>)
-            },
-        )
-        .await
-        .map_err(|_| Error::Storage)?;
-    Ok(entries)
+fn identifier(owner: &str, key: &[u8]) -> Result<(), Error> {
+    if owner.is_empty()
+        || owner.len() > MAX_KEY_BYTES
+        || key.is_empty()
+        || key.len() > MAX_KEY_BYTES
+    {
+        Err(Error::Invalid)
+    } else {
+        Ok(())
+    }
 }
-
-fn validate_name(name: &str) -> Result<(), Error> {
-    if name.is_empty() || name.len() > MAX_NAME_BYTES {
-        return Err(Error::InvalidName);
+fn validate(c: &Checkpoint) -> Result<(), Error> {
+    if c.records.len() > MAX_RECORDS || c.pending.len() > MAX_OUTPUTS {
+        return Err(Error::TooLarge);
+    }
+    let aggregate: usize = c
+        .records
+        .iter()
+        .map(|r| r.owner.len() + r.key.len() + r.value.len())
+        .sum::<usize>()
+        + c.pending.iter().map(|o| o.bytes.len()).sum::<usize>();
+    if aggregate > crate::MAX_CHECKPOINT_BYTES / 4 {
+        return Err(Error::TooLarge);
+    }
+    let mut records = std::collections::BTreeSet::new();
+    for r in &c.records {
+        identifier(&r.owner, &r.key)?;
+        if r.value.len() > MAX_VALUE_BYTES {
+            return Err(Error::TooLarge);
+        }
+        if !records.insert((&r.owner, &r.key)) {
+            return Err(Error::Corrupt);
+        }
+    }
+    let mut outputs = std::collections::BTreeSet::new();
+    for o in &c.pending {
+        if o.bytes.len() > MAX_VALUE_BYTES {
+            return Err(Error::TooLarge);
+        }
+        if !outputs.insert(o.id) {
+            return Err(Error::Invalid);
+        }
     }
     Ok(())
 }
-
-fn validate_key(key: &[u8]) -> Result<(), Error> {
-    if key.is_empty() || key.len() > MAX_KEY_BYTES {
-        return Err(Error::InvalidKey);
-    }
-    Ok(())
+fn aad(context: &[u8], wrapped: &[u8]) -> Vec<u8> {
+    [context, wrapped].concat()
+}
+fn encode(
+    checkpoint: &Checkpoint,
+    key: &Secret,
+    wrapped: &[u8],
+    context: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let plaintext = Zeroizing::new(serde_json::to_vec(checkpoint).map_err(|_| Error::Corrupt)?);
+    let encrypted = veilid_crypt::encrypt(&plaintext, key, &aad(context, wrapped))?;
+    let wire = [HEADER, wrapped, &encrypted].concat();
+    check_size(&wire)?;
+    Ok(wire)
 }
 
-fn to_secret(bytes: &[u8]) -> Result<Secret, Error> {
-    let mut out = Zeroizing::new([0u8; SHARED_SECRET_LENGTH]);
-    if bytes.len() != SHARED_SECRET_LENGTH {
-        return Err(Error::Corrupt);
-    }
-    out.copy_from_slice(bytes);
-    Ok(out)
-}
-
-fn concat(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
-    for part in parts {
-        out.extend_from_slice(part);
-    }
-    out
-}
-
-fn namespace_meta_key(tag: &Tag) -> Vec<u8> {
-    concat(&[NAMESPACE_PREFIX, &tag[..]])
-}
-
-fn seal_namespace(dek: &Secret, tag: &Tag, entry: &NamespaceEntry) -> Result<Vec<u8>, Error> {
-    let plaintext = Zeroizing::new(concat(&[entry.key.as_slice(), entry.name.as_bytes()]));
-    veilid_crypt::encrypt(&plaintext, dek, false, &concat(&[AAD_NAMESPACE, &tag[..]]))
-}
-
-fn open_namespace(dek: &Secret, tag: &Tag, sealed: &[u8]) -> Result<NamespaceEntry, Error> {
-    let plaintext = veilid_crypt::decrypt(sealed, dek, &concat(&[AAD_NAMESPACE, &tag[..]]))?;
-    if plaintext.len() <= SHARED_SECRET_LENGTH {
-        return Err(Error::Corrupt);
-    }
-    let (key, name) = plaintext.split_at(SHARED_SECRET_LENGTH);
-    Ok(NamespaceEntry {
-        key: to_secret(key)?,
-        name: String::from_utf8(name.to_vec()).map_err(|_| Error::Corrupt)?,
-    })
-}
-
-fn seal_key(namespace_key: &Secret, tag: &Tag, key: &[u8]) -> Result<Vec<u8>, Error> {
-    let sealed = veilid_crypt::encrypt(key, namespace_key, true, &concat(&[AAD_KEY, &tag[..]]))?;
-    Ok(concat(&[&tag[..], &sealed[..]]))
-}
-
-fn open_key(
-    namespace_key: &Secret,
-    tag: &Tag,
-    stored_key: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, Error> {
-    if stored_key.len() < TAG_LENGTH || stored_key[..TAG_LENGTH] != tag[..] {
-        return Err(Error::Corrupt);
-    }
-    veilid_crypt::decrypt(
-        &stored_key[TAG_LENGTH..],
-        namespace_key,
-        &concat(&[AAD_KEY, &tag[..]]),
-    )
-}
-
-fn seal_value(namespace_key: &Secret, stored_key: &[u8], value: &[u8]) -> Result<Vec<u8>, Error> {
-    veilid_crypt::encrypt(
-        value,
-        namespace_key,
-        false,
-        &concat(&[AAD_VALUE, stored_key]),
-    )
-}
-
-fn open_value(
-    namespace_key: &Secret,
-    stored_key: &[u8],
-    stored_value: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, Error> {
-    veilid_crypt::decrypt(
-        stored_value,
-        namespace_key,
-        &concat(&[AAD_VALUE, stored_key]),
-    )
-}
+#[cfg(test)]
+#[path = "../tests/unit/internal.rs"]
+mod internal;
