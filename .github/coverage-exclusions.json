@@ -1,0 +1,9 @@
+[
+  {
+    "file": "src/veilid_crypt.rs",
+    "line": 67,
+    "source": ".map_err(|_| Error::Crypto)?;",
+    "reason": "The explicit 8 MiB plaintext bound is below the RustCrypto ChaCha counter exhaustion limit; this defensive encryption-error mapping is unreachable under the upstream contract.",
+    "evidence": "docs/COVERAGE.md#unreachable-defensive-mapping"
+  }
+]

@@ -3,7 +3,8 @@ use super::*;
 use crate::backend::Memory;
 use ckmg::passkey::{PrfOutput, store_cipher};
 
-#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
 fn authenticated_checkpoint_invariants() {
     futures_executor::block_on(async {
         let cipher = store_cipher(&PrfOutput::from_bytes(&[4; 32]).unwrap(), "test").unwrap();
@@ -88,7 +89,8 @@ impl ckmg::Entropy for FailAfter {
         ckmg::Entropy::fill(&mut ckmg::SystemEntropy, out)
     }
 }
-#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
 fn entropy_failures_refuse_creation_and_data_encryption() {
     futures_executor::block_on(async {
         let cipher = store_cipher(&PrfOutput::from_bytes(&[4; 32]).unwrap(), "test").unwrap();

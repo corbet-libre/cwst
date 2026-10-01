@@ -21,3 +21,6 @@ pub const MAX_KEY_BYTES: usize = 256;
 pub const MAX_RECORDS: usize = 1024;
 /// Maximum number of committed outputs awaiting acknowledgement.
 pub const MAX_OUTPUTS: usize = 64;
+
+#[cfg(all(test, target_arch = "wasm32"))]
+wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
