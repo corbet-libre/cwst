@@ -606,3 +606,15 @@ test_async!(aggregate_checkpoint_bound_across_commits, {
     );
     assert_eq!(store.version().unwrap(), 1);
 });
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen_test::wasm_bindgen_test]
+async fn indexeddb_bounds_and_deleted_database_refuse() {
+    assert!(matches!(cwst::browser::IndexedDb::open("").await,Err(Error::Invalid)));
+    assert!(matches!(cwst::browser::IndexedDb::open(&"x".repeat(257)).await,Err(Error::Invalid)));
+    let name=format!("cwst-deletion-{}",js_sys::Date::now());
+    let backend=cwst::browser::IndexedDb::open(&name).await.unwrap();
+    keyvaluedb_web::Database::delete(&name).await.unwrap();
+    assert_eq!(backend.read().await.unwrap_err(),Error::Storage);
+    assert_eq!(backend.compare_exchange(None,b"replacement").await.unwrap_err(),Error::Uncertain);
+}

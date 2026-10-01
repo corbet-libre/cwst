@@ -160,9 +160,30 @@ jobs:
       - name: Measure actual browser Rust lines and branches
         run: cargo llvm-cov test --locked --branch --coverage-target-only --target wasm32-unknown-unknown --lcov --output-path wasm-coverage.lcov --ignore-filename-regex '/tests/'
       - name: Enforce actual browser Rust coverage
-        run: python3 .github/scripts/check-coverage.py wasm-coverage.lcov
+        run: python3 .github/scripts/check-coverage.py wasm-coverage.lcov wasm
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wasm-coverage
           path: wasm-coverage.lcov
+
+  browser-coverage:
+    needs: wasm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-coverage
+          path: browser-coverage*.json

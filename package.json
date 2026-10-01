@@ -1,0 +1,11 @@
+{
+  "name": "cwst-browser-vectors",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test browser/checkpoint.test.js" },
+  "devDependencies": {
+    "istanbul-lib-coverage": "*",
+    "istanbul-lib-instrument": "*",
+    "playwright-core": "*"
+  }
+}

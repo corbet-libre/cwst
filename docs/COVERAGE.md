@@ -37,3 +37,11 @@ See https://wasm-bindgen.github.io/wasm-bindgen/wasm-bindgen-test/coverage.html 
 https://github.com/wasm-bindgen/wasm-bindgen/blob/main/.github/workflows/codecov.yml.
 The strict gate remains red until this additional report is complete; JavaScript
 transaction coverage remains a separate measurement requirement.
+
+JavaScript is measured separately with Istanbul instrumentation inside actual
+Chrome contexts using Playwright. The transaction tests exercise missing storage,
+malformed existing values, predecessor mismatch, simultaneous tabs and a platform
+fault that ignores requested strict durability. The strict gate checks statements,
+lines, functions and branches. No IndexedDB implementation or domain logic is
+replaced. The versionless opener has no blocked-upgrade callback: it never asks
+to upgrade an existing database, and aborts accidental initial creation.

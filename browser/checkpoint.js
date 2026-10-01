@@ -6,14 +6,10 @@ export async function compareCheckpoint(name, expected, next, maximum) {
   next = next.slice();
   if (next.length === 0 || next.length > maximum) throw new Error('storage');
   const db = await new Promise((resolve, reject) => {
-    let done = false;
     const request = indexedDB.open(name);
-    request.onerror = request.onblocked = () => { done = true; reject(new Error('storage')); };
+    request.onerror = () => reject(new Error('storage'));
     request.onupgradeneeded = () => request.transaction.abort();
-    request.onsuccess = () => {
-      if (done) request.result.close();
-      else resolve(request.result);
-    };
+    request.onsuccess = () => resolve(request.result);
   });
   try {
     return await new Promise((resolve, reject) => {
