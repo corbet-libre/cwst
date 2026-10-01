@@ -6,7 +6,8 @@
     "reason": "The explicit 8 MiB plaintext bound is below the RustCrypto ChaCha counter exhaustion limit; this defensive encryption-error mapping is unreachable under the upstream contract.",
     "evidence": "docs/COVERAGE.md#unreachable-defensive-mapping",
     "targets": [
-      "native"
+      "native",
+      "wasm"
     ]
   }
 ]

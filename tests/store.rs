@@ -608,6 +608,25 @@ test_async!(aggregate_checkpoint_bound_across_commits, {
 });
 
 #[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
+export function abortNextDatabaseUpgrade(name) {
+    const original = IDBFactory.prototype.open;
+    IDBFactory.prototype.open = function(...args) {
+        const request = original.apply(this, args);
+        if (args[0] === name) {
+            IDBFactory.prototype.open = original;
+            request.addEventListener('upgradeneeded', () => request.transaction.abort(), {once: true});
+        }
+        return request;
+    };
+}
+")]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = abortNextDatabaseUpgrade)]
+    fn abort_next_database_upgrade(name: &str);
+}
+
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen_test::wasm_bindgen_test]
 async fn indexeddb_bounds_and_deleted_database_refuse() {
     assert!(matches!(
@@ -618,6 +637,15 @@ async fn indexeddb_bounds_and_deleted_database_refuse() {
         cwst::browser::IndexedDb::open(&"x".repeat(257)).await,
         Err(Error::Invalid)
     ));
+    // Abort a real platform upgrade transaction. The upstream adapter must
+    // propagate the actual IndexedDB AbortError as a coarse storage failure.
+    let refused = format!("cwst-aborted-upgrade-{}", js_sys::Date::now());
+    abort_next_database_upgrade(&refused);
+    assert!(matches!(
+        cwst::browser::IndexedDb::open(&refused).await,
+        Err(Error::Storage)
+    ));
+    assert!(!keyvaluedb_web::Database::delete(&refused).await.unwrap());
     let name = format!("cwst-deletion-{}", js_sys::Date::now());
     let backend = cwst::browser::IndexedDb::open(&name).await.unwrap();
     keyvaluedb_web::Database::delete(&name).await.unwrap();
@@ -629,4 +657,11 @@ async fn indexeddb_bounds_and_deleted_database_refuse() {
             .unwrap_err(),
         Error::Uncertain
     );
+}
+
+// Link the maintained profiling runtime only into the instrumented test binary.
+#[cfg(all(target_arch = "wasm32", owned_browser_coverage))]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn profiling_runtime_is_linked() {
+    let _ = browser_coverage_runtime::__owned_test_module_signature();
 }
