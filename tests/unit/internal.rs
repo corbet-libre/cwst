@@ -121,3 +121,9 @@ fn entropy_failures_refuse_creation_and_data_encryption() {
         );
     });
 }
+
+#[cfg(all(target_arch = "wasm32", owned_browser_coverage))]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn profiling_runtime_is_linked() {
+    let _ = browser_coverage_runtime::__owned_test_module_signature();
+}
