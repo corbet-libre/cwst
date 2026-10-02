@@ -43,3 +43,18 @@ No operator backup or recovery surface exists here.
 
 The former password-based development layout is intentionally replaced without a
 migration path. `veilid_crypt.rs` retains its MPL-2.0 header and modification record.
+
+## Compound commit receipts
+
+`commit_with_receipt` performs the existing atomic commit and returns a constructor-private
+`CommitReceipt`. `receipt(operation)` reconstitutes one only from the authenticated
+current checkpoint after reopen. Locked, uncertain, or mismatched operations refuse.
+The receipt has no Clone/serde and binds the encrypted store identity, scope, version,
+operation, and final stored record/outbox bytes via BLAKE3. `is_commit(&store, &operation)`
+refuses another store with the same scope or a newer in-memory checkpoint. It does not
+claim that an independently changed backend is unchanged: the next write still needs
+Storage's actual CAS. `contains_record`/`contains_output` compare exact owner candidate
+digests, so transient mutations overwritten/deleted later in a batch cannot authorize
+adoption. Wallet must require its exact operation, expected next version, and all
+candidate/output digests, then consume the receipt when adopting. Storage proves
+persistence only; issuer/domain acceptance remains the owner's obligation.

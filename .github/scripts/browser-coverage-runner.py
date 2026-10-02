@@ -2,6 +2,7 @@
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -46,7 +47,12 @@ def main():
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
-        driver = webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
+        executable = os.environ.get("CHROMEDRIVER") or shutil.which("chromedriver")
+        browser = os.environ.get("CHROME_BIN") or shutil.which("chromium") or shutil.which("google-chrome")
+        if not executable or not browser:
+            raise RuntimeError("an explicit installed Chrome browser and driver are required")
+        options.binary_location = browser
+        driver = webdriver.Chrome(service=Service(executable), options=options)
         driver.set_page_load_timeout(120)
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
             window.__coverageLog = [];

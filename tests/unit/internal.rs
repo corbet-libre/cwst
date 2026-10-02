@@ -14,7 +14,7 @@ fn authenticated_checkpoint_invariants() {
             .unwrap();
         let original = backend.read().await.unwrap().unwrap();
         let current = store.current().unwrap();
-        let valid = serde_json::to_value(&current.checkpoint).unwrap();
+        let valid = serde_json::to_value(current.checkpoint.as_ref()).unwrap();
         let mut cases = Vec::new();
         let record = serde_json::json!({"owner":"a","key":[1],"value":[2]});
         let mut v = valid.clone();
@@ -60,7 +60,7 @@ fn authenticated_checkpoint_invariants() {
                 .await
                 .unwrap();
         }
-        let mut c = current.checkpoint.clone();
+        let mut c = current.checkpoint.as_ref().clone();
         c.version = u64::MAX;
         let wire = encode(&c, &current.key, &current.wrapped, &store.context).unwrap();
         backend
@@ -126,4 +126,30 @@ fn entropy_failures_refuse_creation_and_data_encryption() {
 #[wasm_bindgen_test::wasm_bindgen_test]
 fn profiling_runtime_is_linked() {
     let _ = browser_coverage_runtime::__owned_test_module_signature();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn poisoned_shared_checkpoint_stays_closed_when_the_store_is_locked() {
+    futures_executor::block_on(async {
+        let cipher = store_cipher(&PrfOutput::from_bytes(&[4; 32]).unwrap(), "test").unwrap();
+        let mut store = Store::create(Memory::new(), &cipher, "test").await.unwrap();
+        let shared = store.readable.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _held = shared.lock().unwrap();
+            panic!("poison the shared checkpoint");
+        });
+        assert!(poisoner.join().is_err());
+        store.lock_in_place();
+        assert!(matches!(store.version(), Err(Error::Locked)));
+        // The wiped checkpoint stays closed to readers even though the mutex is poisoned.
+        assert!(store.readable.lock().is_err());
+        assert!(
+            store
+                .readable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+    });
 }

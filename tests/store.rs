@@ -59,8 +59,9 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
         id: [8; 32],
         bytes: b"exact pending ciphertext".to_vec(),
     };
-    store
-        .commit(
+    assert!(store.receipt(&[0; 32]).is_err());
+    let receipt = store
+        .commit_with_receipt(
             0,
             [1; 32],
             &changes(b"accepted opening", b"MLS and history"),
@@ -68,6 +69,43 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
         )
         .await
         .unwrap();
+    assert!(receipt.is_commit(&store, &[1; 32]));
+    assert!(!receipt.is_commit(&store, &[2; 32]));
+    assert_eq!(receipt.version(), 1);
+    assert!(receipt.contains_record(
+        "wallet",
+        b"state",
+        blake3::hash(b"accepted opening").as_bytes()
+    ));
+    assert!(!receipt.contains_record(
+        "wallet",
+        b"other",
+        blake3::hash(b"accepted opening").as_bytes()
+    ));
+    assert!(!receipt.contains_record("wallet", b"state", blake3::hash(b"other").as_bytes()));
+    assert!(receipt.contains_output(
+        &[8; 32],
+        blake3::hash(b"exact pending ciphertext").as_bytes()
+    ));
+    assert!(!receipt.contains_output(
+        &[9; 32],
+        blake3::hash(b"exact pending ciphertext").as_bytes()
+    ));
+    assert!(!receipt.contains_output(&[8; 32], blake3::hash(b"other").as_bytes()));
+    assert_eq!(format!("{receipt:?}"), "CommitReceipt([redacted])");
+    let mut foreign = Store::create(Memory::new(), &key, "community")
+        .await
+        .unwrap();
+    foreign
+        .commit(
+            0,
+            [1; 32],
+            &changes(b"accepted opening", b"MLS and history"),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!receipt.is_commit(&foreign, &[1; 32]));
     assert!(store.is_scope("community"));
     assert!(!store.is_scope("other"));
     assert_eq!(store.version().unwrap(), 1);
@@ -81,10 +119,20 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
     ] {
         assert!(!bytes.windows(plaintext.len()).any(|s| s == plaintext));
     }
-    store.lock();
+    store.lock_in_place();
+    assert!(!receipt.is_commit(&store, &[1; 32]));
+    assert!(store.receipt(&[1; 32]).is_err());
     let mut reopened = Store::open(backend.clone(), &key, "community")
         .await
         .unwrap();
+    assert!(receipt.is_commit(&reopened, &[1; 32]));
+    assert!(
+        reopened
+            .receipt(&[1; 32])
+            .unwrap()
+            .is_commit(&reopened, &[1; 32])
+    );
+    assert!(reopened.receipt(&[9; 32]).is_err());
     assert_eq!(
         reopened.read("wallet", b"state").unwrap(),
         Some(b"accepted opening".as_slice())
@@ -99,6 +147,7 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
         b"exact pending ciphertext"
     );
     reopened.ack_output(1, [2; 32], [8; 32]).await.unwrap();
+    assert!(!receipt.is_commit(&reopened, &[1; 32]));
     assert!(reopened.load_pending().unwrap().is_empty());
     assert_eq!(
         reopened.ack_output(2, [3; 32], [8; 32]).await.unwrap_err(),
@@ -132,6 +181,54 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
 }
 test_async!(memory_round_trip, {
     round_trip(Memory::new()).await;
+});
+
+test_async!(receipt_binds_final_mutation_not_an_overwritten_candidate, {
+    let mut store = Store::create(Memory::new(), &cipher(1), "community")
+        .await
+        .unwrap();
+    let receipt = store
+        .commit_with_receipt(
+            0,
+            [1; 32],
+            &[
+                Change::Put {
+                    owner: "wallet",
+                    key: b"state",
+                    value: b"candidate",
+                },
+                Change::Put {
+                    owner: "wallet",
+                    key: b"state",
+                    value: b"replacement",
+                },
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!receipt.contains_record("wallet", b"state", blake3::hash(b"candidate").as_bytes()));
+    assert!(receipt.contains_record("wallet", b"state", blake3::hash(b"replacement").as_bytes()));
+    let receipt = store
+        .commit_with_receipt(
+            1,
+            [2; 32],
+            &[
+                Change::Put {
+                    owner: "wallet",
+                    key: b"state",
+                    value: b"candidate",
+                },
+                Change::Delete {
+                    owner: "wallet",
+                    key: b"state",
+                },
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!receipt.contains_record("wallet", b"state", blake3::hash(b"candidate").as_bytes()));
 });
 
 test_async!(fence_competing_writers, {
@@ -309,7 +406,7 @@ test_async!(crash_and_cancel_reconcile_exact_outputs, {
     mode.set(2);
     assert_eq!(
         store
-            .commit(0, [2; 32], &changes(b"no", b"no"), &[])
+            .commit_with_receipt(0, [2; 32], &changes(b"no", b"no"), &[])
             .await
             .unwrap_err(),
         Error::Storage
@@ -320,7 +417,7 @@ test_async!(crash_and_cancel_reconcile_exact_outputs, {
     mode.set(3);
     assert_eq!(
         store
-            .commit(
+            .commit_with_receipt(
                 0,
                 [3; 32],
                 &changes(b"yes", b"yes"),
@@ -334,9 +431,15 @@ test_async!(crash_and_cancel_reconcile_exact_outputs, {
         Error::Uncertain
     );
     assert_eq!(store.read("wallet", b"state").unwrap_err(), Error::Locked);
+    assert_eq!(store.receipt(&[3; 32]).unwrap_err(), Error::Locked);
     mode.set(0);
     store = Store::open(backend.clone(), &key, "s").await.unwrap();
     assert_eq!(store.operation().unwrap(), [3; 32]);
+    assert!(store.receipt(&[3; 32]).unwrap().contains_record(
+        "wallet",
+        b"state",
+        blake3::hash(b"yes").as_bytes()
+    ));
     assert_eq!(store.load_pending().unwrap()[0].bytes, vec![9]);
     mode.set(4);
     assert!(
@@ -665,3 +768,163 @@ async fn indexeddb_bounds_and_deleted_database_refuse() {
 fn profiling_runtime_is_linked() {
     let _ = browser_coverage_runtime::__owned_test_module_signature();
 }
+
+test_async!(live_owner_reads_follow_only_completed_commits, {
+    let backend = Memory::new();
+    let key = cipher(1);
+    let mut store = Store::create(backend.clone(), &key, "s").await.unwrap();
+    assert!(matches!(store.read_handle(""), Err(Error::Invalid)));
+    assert!(matches!(
+        store.read_handle(&"x".repeat(cwst::MAX_KEY_BYTES + 1)),
+        Err(Error::Invalid)
+    ));
+    let reader = store.read_handle("wallet").unwrap();
+    let other = store.read_handle("other").unwrap();
+    assert!(reader.is_scope("s"));
+    assert!(!reader.is_scope("other"));
+    assert_eq!(reader.read(b"state", 0).unwrap(), None);
+    assert_eq!(reader.read(b"", 10), Err(Error::Invalid));
+    assert_eq!(format!("{reader:?}"), "ReadHandle([redacted])");
+    store
+        .commit(0, [1; 32], &changes(b"first", b"elsewhere"), &[])
+        .await
+        .unwrap();
+    assert_eq!(reader.read(b"state", 5).unwrap(), Some(b"first".to_vec()));
+    assert_eq!(reader.read(b"state", 4), Err(Error::TooLarge));
+    assert_eq!(other.read(b"state", 100).unwrap(), None);
+    // Refused candidates leave the actual committed view unchanged.
+    assert_eq!(
+        store.commit(0, [2; 32], &[], &[]).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(reader.read(b"state", 5).unwrap(), Some(b"first".to_vec()));
+    store
+        .commit(1, [2; 32], &changes(b"second", b"new"), &[])
+        .await
+        .unwrap();
+    assert_eq!(reader.read(b"state", 6).unwrap(), Some(b"second".to_vec()));
+    store
+        .commit(
+            2,
+            [3; 32],
+            &[Change::Delete {
+                owner: "wallet",
+                key: b"state",
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader.read(b"state", 0).unwrap(), None);
+    store.lock_in_place();
+    assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+    assert_eq!(
+        store.read_handle("wallet").unwrap().read(b"state", 100),
+        Err(Error::Locked)
+    );
+    let reopened = Store::open(backend, &key, "s").await.unwrap();
+    let reopened_reader = reopened.read_handle("threads").unwrap();
+    assert_eq!(
+        reopened_reader.read(b"state", 3).unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+    drop(reopened);
+    assert_eq!(reopened_reader.read(b"state", 100), Err(Error::Locked));
+});
+
+test_async!(
+    live_owner_reads_revoke_during_uncertain_or_cancelled_writes,
+    {
+        use futures::FutureExt;
+        for fault in [2, 3, 4] {
+            let mode = std::rc::Rc::new(std::cell::Cell::new(0));
+            let backend = Faults {
+                inner: Memory::new(),
+                mode: mode.clone(),
+            };
+            let key = cipher(1);
+            let mut store = Store::create(backend.clone(), &key, "s").await.unwrap();
+            store
+                .commit(0, [1; 32], &changes(b"before", b"before"), &[])
+                .await
+                .unwrap();
+            let reader = store.read_handle("wallet").unwrap();
+            mode.set(fault);
+            let changes = changes(b"after", b"after");
+            let mut pending = Box::pin(store.commit(1, [2; 32], &changes, &[]));
+            let outcome = pending.as_mut().now_or_never();
+            assert_eq!(
+                outcome,
+                match fault {
+                    2 => Some(Err(Error::Storage)),
+                    3 => Some(Err(Error::Uncertain)),
+                    _ => None,
+                }
+            );
+            // Polling may already have durably written bytes; until the real CAS
+            // returns success, neither those bytes nor the old snapshot is readable.
+            assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+            drop(pending);
+            assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+            assert_eq!(store.version(), Err(Error::Locked));
+            mode.set(0);
+            let reopened = Store::open(backend, &key, "s").await.unwrap();
+            let actual = reopened.read_handle("wallet").unwrap();
+            let expected = if fault == 2 {
+                b"before".as_slice()
+            } else {
+                b"after".as_slice()
+            };
+            assert_eq!(
+                actual.read(b"state", 100).unwrap().as_deref(),
+                Some(expected)
+            );
+            assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+        }
+    }
+);
+
+test_async!(
+    receipt_binds_scope_version_and_operation_of_the_current_checkpoint,
+    {
+        let key = cipher(1);
+        let mut store = Store::create(Memory::new(), &key, "community")
+            .await
+            .unwrap();
+        let receipt = store
+            .commit_with_receipt(0, [1; 32], &changes(b"a", b"b"), &[])
+            .await
+            .unwrap();
+        assert!(receipt.is_commit(&store, &[1; 32]));
+        // Another scope never adopts this receipt, even with the same key material.
+        let other = Store::create(Memory::new(), &key, "other-community")
+            .await
+            .unwrap();
+        assert!(!receipt.is_commit(&other, &[1; 32]));
+        // Committing the same operation identifier again moves the version fence.
+        store
+            .commit(1, [1; 32], &changes(b"c", b"d"), &[])
+            .await
+            .unwrap();
+        assert!(!receipt.is_commit(&store, &[1; 32]));
+    }
+);
+
+test_async!(
+    consuming_lock_wipes_the_state_and_leaves_the_backend_reopenable,
+    {
+        let backend = Memory::new();
+        let key = cipher(1);
+        let mut store = Store::create(backend.clone(), &key, "community")
+            .await
+            .unwrap();
+        store
+            .commit(0, [1; 32], &changes(b"a", b"b"), &[])
+            .await
+            .unwrap();
+        store.lock();
+        let reopened = Store::open(backend, &key, "community").await.unwrap();
+        assert_eq!(reopened.version().unwrap(), 1);
+    }
+);
