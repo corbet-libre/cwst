@@ -2,30 +2,25 @@
 
 ## Scope
 
-**Purpose and home.** Encrypted device persistence under `cmsg → cvlt → cwst`,
-using IndexedDB in browsers and files natively. Atomic versioned checkpoints span
-opaque owner records and pending outputs.
+### Purpose
 
-**Owns.** A random data key wrapped by Keys' opaque `StoreCipher`, authenticated
-checkpoint encryption, compare-and-swap commits, writer fencing, pending outputs
-and acknowledgements. The IndexedDB adapter uses `keyvaluedb-web`; the data-tier
-cryptography retains its Veilid-derived MPL file.
+Encrypted device persistence with atomic, versioned checkpoints spanning opaque owner records and pending outputs, using browser storage on the web and files natively.
 
-**Never.** Receives PRF, passkey material, roots or raw wrapping keys; writes
-plaintext journals or backups; publishes before commit; invents owner merge rules;
-resets a known checkpoint to revision zero; implements operator recovery.
+### Owns
 
-**States and ports.** Closed/Locked → Open(version); commit → Committed, conflict →
-Reload, uncertain outcome → Reconcile, corrupt or unauthenticated input → Refused.
-`Store<B>` supplies `create`, `open`, `read`, `commit`, `load_pending`, `ack_output`,
-`version`, `operation` and `lock`. Backends are native files, IndexedDB and Memory.
+Checkpoint encryption under a random data key wrapped by an opaque store capability from `ckmg`; atomic compare-and-swap commit of several owners' records plus pending outputs in one transaction, with support for listing pending outputs and acknowledging them; native file, browser, and in-memory backends.
 
-**Invariants and tests.** Member secrets stay on member devices and established
-cryptographic crates implement primitives. Real file and IndexedDB reopen/decrypt,
-wrong key/scope/tampering, process crashes and competing writers must leave the old
-or complete new checkpoint. Pending outputs survive without repeated effects.
-Native and actual browser tests cover bounds, cancellation, corruption and errors;
-reachable source lines and branches must be fully covered.
+### Never
+
+Receives passkey or PRF secrets or raw wrapping keys; writes plaintext or unencrypted journals or backups; publishes outputs before commit; invents merge rules for owner records; resets a known checkpoint to revision zero; provides operator backup.
+
+### States
+
+Closed and Locked before opening with a version; Prepared commits atomically; conflicts reload; uncertain outcomes reconcile; corrupt or unauthenticated data is refused.
+
+### Test obligations
+
+Real file and browser storage reopen and decrypt; wrong key, wrong scope, and tampering fail; a crash at every commit and publication boundary leaves the old or the complete new checkpoint; competing tabs or processes cannot mix revisions from different owners; pending outputs retry without repeating effects; resource bounds are refused; native and browser builds share identical test vectors with full line and branch coverage over real round trips and injected faults.
 
 ## Implementation
 
