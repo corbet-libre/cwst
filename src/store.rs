@@ -217,8 +217,44 @@ impl<B: Backend> Store<B> {
     }
     /// Open an existing checkpoint. Wrong scope/key and corruption never create state.
     pub async fn open(backend: B, cipher: &StoreCipher, scope: &str) -> Result<Self, Error> {
-        let context = context(scope)?;
+        context(scope)?;
         let wire = backend.read().await?.ok_or(Error::NotInitialized)?;
+        Self::from_wire(backend, cipher, scope, wire)
+    }
+    /// Borrow the exact authenticated encrypted checkpoint for private Records
+    /// retention. This is not a domain export: no decrypted owner bytes or keys
+    /// are exposed, and the borrow ends when this Store is mutated or locked.
+    pub fn sealed_checkpoint(&self) -> Result<&[u8], Error> {
+        Ok(&self.current()?.wire)
+    }
+    /// Restore exact retained ciphertext into an empty local destination only.
+    /// Original scope, wrapping and checkpoint authentication complete before any
+    /// write. Existing local state is never replaced. Cancellation/uncertainty
+    /// may have persisted the bytes; reopen the destination to reconcile it.
+    /// This verifies Storage, not network freshness, membership or lineage.
+    pub async fn restore(
+        backend: B,
+        cipher: &StoreCipher,
+        scope: &str,
+        expected_version: u64,
+        wire: &[u8],
+    ) -> Result<Self, Error> {
+        check_size(wire)?;
+        let store = Self::from_wire(backend, cipher, scope, wire.to_vec())?;
+        store.expect(expected_version)?;
+        match store.backend.compare_exchange(None, wire).await {
+            Err(Error::Conflict) => Err(Error::AlreadyInitialized),
+            Err(error) => Err(error),
+            Ok(()) => Ok(store),
+        }
+    }
+    fn from_wire(
+        backend: B,
+        cipher: &StoreCipher,
+        scope: &str,
+        wire: Vec<u8>,
+    ) -> Result<Self, Error> {
+        let context = context(scope)?;
         check_size(&wire)?;
         if !wire.starts_with(HEADER) || wire.len() < HEADER.len() + WRAPPED_BYTES + 40 {
             return Err(Error::Corrupt);

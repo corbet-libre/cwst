@@ -58,3 +58,14 @@ digests, so transient mutations overwritten/deleted later in a batch cannot auth
 adoption. Wallet must require its exact operation, expected next version, and all
 candidate/output digests, then consume the receipt when adopting. Storage proves
 persistence only; issuer/domain acceptance remains the owner's obligation.
+
+Records retention borrows only `Store::sealed_checkpoint`, the exact authenticated
+ciphertext already durably held by the original Store. It exposes neither owner
+plaintext nor a root/wrapping key and is not a user backup/export format.
+`Store::restore` validates that same original framing, scope, wrapping AEAD,
+checkpoint schema and expected version before its first write. It uses only
+`Backend::compare_exchange(None, wire)`: an existing local checkpoint, even an
+identical one, is never overwritten. A conflict is AlreadyInitialized. Interrupted
+or uncertain CAS may have persisted the exact bytes, so the caller reopens the
+original destination to reconcile. Storage never attests network freshness,
+current passkey/lineage, available replicas or application readiness.

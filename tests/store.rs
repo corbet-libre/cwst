@@ -928,3 +928,135 @@ test_async!(
         assert_eq!(reopened.version().unwrap(), 1);
     }
 );
+
+test_async!(
+    retained_compound_wire_restores_exact_owners_outputs_and_fences,
+    {
+        let key = cipher(7);
+        let source = Memory::new();
+        let mut original = Store::create(source.clone(), &key, "restore")
+            .await
+            .unwrap();
+        original
+            .commit(
+                0,
+                [41; 32],
+                &changes(b"wallet-original", b"threads-original"),
+                &[Output {
+                    id: [42; 32],
+                    bytes: b"outbox-original".to_vec(),
+                }],
+            )
+            .await
+            .unwrap();
+        let wire = original.sealed_checkpoint().unwrap().to_vec();
+        assert_eq!(source.read().await.unwrap().unwrap(), wire);
+        let destination = Memory::new();
+        let restored = Store::restore(destination.clone(), &key, "restore", 1, &wire)
+            .await
+            .unwrap();
+        assert_eq!(restored.sealed_checkpoint().unwrap(), wire);
+        assert_eq!(restored.operation().unwrap(), [41; 32]);
+        assert_eq!(
+            restored.read("wallet", b"state").unwrap().unwrap(),
+            b"wallet-original"
+        );
+        assert_eq!(
+            restored.read("threads", b"state").unwrap().unwrap(),
+            b"threads-original"
+        );
+        assert_eq!(
+            restored.load_pending().unwrap()[0].bytes,
+            b"outbox-original"
+        );
+        restored.lock();
+        assert_eq!(
+            Store::open(destination.clone(), &key, "restore")
+                .await
+                .unwrap()
+                .version()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            Store::restore(destination.clone(), &key, "restore", 1, &wire)
+                .await
+                .unwrap_err(),
+            Error::AlreadyInitialized
+        );
+        assert_eq!(destination.read().await.unwrap().unwrap(), wire);
+        for (scope, expected, bytes) in [
+            ("wrong", 1, wire.clone()),
+            ("restore", 0, wire.clone()),
+            ("restore", 1, {
+                let mut bad = wire.clone();
+                *bad.last_mut().unwrap() ^= 1;
+                bad
+            }),
+            ("restore", 1, vec![]),
+            ("restore", 1, vec![0; cwst::MAX_CHECKPOINT_BYTES + 1]),
+        ] {
+            let empty = Memory::new();
+            assert!(
+                Store::restore(empty.clone(), &key, scope, expected, &bytes)
+                    .await
+                    .is_err()
+            );
+            assert!(empty.read().await.unwrap().is_none());
+        }
+        let empty = Memory::new();
+        assert!(
+            Store::restore(empty.clone(), &cipher(8), "restore", 1, &wire)
+                .await
+                .is_err()
+        );
+        assert!(empty.read().await.unwrap().is_none());
+        original.lock_in_place();
+        assert_eq!(original.sealed_checkpoint(), Err(Error::Locked));
+    }
+);
+
+test_async!(
+    retained_restore_unknown_and_cancelled_cas_reopen_original_bytes,
+    {
+        use futures::FutureExt;
+        let key = cipher(7);
+        let original = Store::create(Memory::new(), &key, "restore").await.unwrap();
+        let wire = original.sealed_checkpoint().unwrap().to_vec();
+        for fault in [2, 3, 4] {
+            let mode = std::rc::Rc::new(std::cell::Cell::new(fault));
+            let backend = Faults {
+                inner: Memory::new(),
+                mode: mode.clone(),
+            };
+            let mut pending = Box::pin(Store::restore(backend.clone(), &key, "restore", 0, &wire));
+            match pending.as_mut().now_or_never() {
+                Some(Err(Error::Storage)) if fault == 2 => {}
+                Some(Err(Error::Uncertain)) if fault == 3 => {}
+                None if fault == 4 => {}
+                _ => panic!("unexpected restore outcome"),
+            }
+            drop(pending);
+            mode.set(0);
+            if fault == 2 {
+                assert!(backend.read().await.unwrap().is_none());
+            } else {
+                assert_eq!(
+                    Store::open(backend, &key, "restore")
+                        .await
+                        .unwrap()
+                        .sealed_checkpoint()
+                        .unwrap(),
+                    wire
+                );
+            }
+        }
+        let destination = Memory::new();
+        let (one, two) = futures::join!(
+            Store::restore(destination.clone(), &key, "restore", 0, &wire),
+            Store::restore(destination.clone(), &key, "restore", 0, &wire)
+        );
+        assert!(one.is_ok() ^ two.is_ok());
+        assert_eq!(one.err().or(two.err()).unwrap(), Error::AlreadyInitialized);
+    }
+);
