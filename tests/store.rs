@@ -59,8 +59,9 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
         id: [8; 32],
         bytes: b"exact pending ciphertext".to_vec(),
     };
-    store
-        .commit(
+    assert!(store.receipt(&[0; 32]).is_err());
+    let receipt = store
+        .commit_with_receipt(
             0,
             [1; 32],
             &changes(b"accepted opening", b"MLS and history"),
@@ -68,6 +69,43 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
         )
         .await
         .unwrap();
+    assert!(receipt.is_commit(&store, &[1; 32]));
+    assert!(!receipt.is_commit(&store, &[2; 32]));
+    assert_eq!(receipt.version(), 1);
+    assert!(receipt.contains_record(
+        "wallet",
+        b"state",
+        blake3::hash(b"accepted opening").as_bytes()
+    ));
+    assert!(!receipt.contains_record(
+        "wallet",
+        b"other",
+        blake3::hash(b"accepted opening").as_bytes()
+    ));
+    assert!(!receipt.contains_record("wallet", b"state", blake3::hash(b"other").as_bytes()));
+    assert!(receipt.contains_output(
+        &[8; 32],
+        blake3::hash(b"exact pending ciphertext").as_bytes()
+    ));
+    assert!(!receipt.contains_output(
+        &[9; 32],
+        blake3::hash(b"exact pending ciphertext").as_bytes()
+    ));
+    assert!(!receipt.contains_output(&[8; 32], blake3::hash(b"other").as_bytes()));
+    assert_eq!(format!("{receipt:?}"), "CommitReceipt([redacted])");
+    let mut foreign = Store::create(Memory::new(), &key, "community")
+        .await
+        .unwrap();
+    foreign
+        .commit(
+            0,
+            [1; 32],
+            &changes(b"accepted opening", b"MLS and history"),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!receipt.is_commit(&foreign, &[1; 32]));
     assert!(store.is_scope("community"));
     assert!(!store.is_scope("other"));
     assert_eq!(store.version().unwrap(), 1);
@@ -81,10 +119,20 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
     ] {
         assert!(!bytes.windows(plaintext.len()).any(|s| s == plaintext));
     }
-    store.lock();
+    store.lock_in_place();
+    assert!(!receipt.is_commit(&store, &[1; 32]));
+    assert!(store.receipt(&[1; 32]).is_err());
     let mut reopened = Store::open(backend.clone(), &key, "community")
         .await
         .unwrap();
+    assert!(receipt.is_commit(&reopened, &[1; 32]));
+    assert!(
+        reopened
+            .receipt(&[1; 32])
+            .unwrap()
+            .is_commit(&reopened, &[1; 32])
+    );
+    assert!(reopened.receipt(&[9; 32]).is_err());
     assert_eq!(
         reopened.read("wallet", b"state").unwrap(),
         Some(b"accepted opening".as_slice())
@@ -99,6 +147,7 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
         b"exact pending ciphertext"
     );
     reopened.ack_output(1, [2; 32], [8; 32]).await.unwrap();
+    assert!(!receipt.is_commit(&reopened, &[1; 32]));
     assert!(reopened.load_pending().unwrap().is_empty());
     assert_eq!(
         reopened.ack_output(2, [3; 32], [8; 32]).await.unwrap_err(),
@@ -132,6 +181,54 @@ async fn round_trip<B: Backend + Clone>(backend: B) {
 }
 test_async!(memory_round_trip, {
     round_trip(Memory::new()).await;
+});
+
+test_async!(receipt_binds_final_mutation_not_an_overwritten_candidate, {
+    let mut store = Store::create(Memory::new(), &cipher(1), "community")
+        .await
+        .unwrap();
+    let receipt = store
+        .commit_with_receipt(
+            0,
+            [1; 32],
+            &[
+                Change::Put {
+                    owner: "wallet",
+                    key: b"state",
+                    value: b"candidate",
+                },
+                Change::Put {
+                    owner: "wallet",
+                    key: b"state",
+                    value: b"replacement",
+                },
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!receipt.contains_record("wallet", b"state", blake3::hash(b"candidate").as_bytes()));
+    assert!(receipt.contains_record("wallet", b"state", blake3::hash(b"replacement").as_bytes()));
+    let receipt = store
+        .commit_with_receipt(
+            1,
+            [2; 32],
+            &[
+                Change::Put {
+                    owner: "wallet",
+                    key: b"state",
+                    value: b"candidate",
+                },
+                Change::Delete {
+                    owner: "wallet",
+                    key: b"state",
+                },
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!receipt.contains_record("wallet", b"state", blake3::hash(b"candidate").as_bytes()));
 });
 
 test_async!(fence_competing_writers, {
@@ -309,7 +406,7 @@ test_async!(crash_and_cancel_reconcile_exact_outputs, {
     mode.set(2);
     assert_eq!(
         store
-            .commit(0, [2; 32], &changes(b"no", b"no"), &[])
+            .commit_with_receipt(0, [2; 32], &changes(b"no", b"no"), &[])
             .await
             .unwrap_err(),
         Error::Storage
@@ -320,7 +417,7 @@ test_async!(crash_and_cancel_reconcile_exact_outputs, {
     mode.set(3);
     assert_eq!(
         store
-            .commit(
+            .commit_with_receipt(
                 0,
                 [3; 32],
                 &changes(b"yes", b"yes"),
@@ -334,9 +431,15 @@ test_async!(crash_and_cancel_reconcile_exact_outputs, {
         Error::Uncertain
     );
     assert_eq!(store.read("wallet", b"state").unwrap_err(), Error::Locked);
+    assert_eq!(store.receipt(&[3; 32]).unwrap_err(), Error::Locked);
     mode.set(0);
     store = Store::open(backend.clone(), &key, "s").await.unwrap();
     assert_eq!(store.operation().unwrap(), [3; 32]);
+    assert!(store.receipt(&[3; 32]).unwrap().contains_record(
+        "wallet",
+        b"state",
+        blake3::hash(b"yes").as_bytes()
+    ));
     assert_eq!(store.load_pending().unwrap()[0].bytes, vec![9]);
     mode.set(4);
     assert!(
@@ -665,3 +768,686 @@ async fn indexeddb_bounds_and_deleted_database_refuse() {
 fn profiling_runtime_is_linked() {
     let _ = browser_coverage_runtime::__owned_test_module_signature();
 }
+
+test_async!(live_owner_reads_follow_only_completed_commits, {
+    let backend = Memory::new();
+    let key = cipher(1);
+    let mut store = Store::create(backend.clone(), &key, "s").await.unwrap();
+    assert!(matches!(store.read_handle(""), Err(Error::Invalid)));
+    assert!(matches!(
+        store.read_handle(&"x".repeat(cwst::MAX_KEY_BYTES + 1)),
+        Err(Error::Invalid)
+    ));
+    let reader = store.read_handle("wallet").unwrap();
+    let other = store.read_handle("other").unwrap();
+    assert!(reader.is_scope("s"));
+    assert!(!reader.is_scope("other"));
+    assert_eq!(reader.read(b"state", 0).unwrap(), None);
+    assert_eq!(reader.read(b"", 10), Err(Error::Invalid));
+    assert_eq!(format!("{reader:?}"), "ReadHandle([redacted])");
+    store
+        .commit(0, [1; 32], &changes(b"first", b"elsewhere"), &[])
+        .await
+        .unwrap();
+    assert_eq!(reader.read(b"state", 5).unwrap(), Some(b"first".to_vec()));
+    assert_eq!(reader.read(b"state", 4), Err(Error::TooLarge));
+    assert_eq!(other.read(b"state", 100).unwrap(), None);
+    // Refused candidates leave the actual committed view unchanged.
+    assert_eq!(
+        store.commit(0, [2; 32], &[], &[]).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(reader.read(b"state", 5).unwrap(), Some(b"first".to_vec()));
+    store
+        .commit(1, [2; 32], &changes(b"second", b"new"), &[])
+        .await
+        .unwrap();
+    assert_eq!(reader.read(b"state", 6).unwrap(), Some(b"second".to_vec()));
+    store
+        .commit(
+            2,
+            [3; 32],
+            &[Change::Delete {
+                owner: "wallet",
+                key: b"state",
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader.read(b"state", 0).unwrap(), None);
+    store.lock_in_place();
+    assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+    assert_eq!(
+        store.read_handle("wallet").unwrap().read(b"state", 100),
+        Err(Error::Locked)
+    );
+    let reopened = Store::open(backend, &key, "s").await.unwrap();
+    let reopened_reader = reopened.read_handle("threads").unwrap();
+    assert_eq!(
+        reopened_reader.read(b"state", 3).unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+    drop(reopened);
+    assert_eq!(reopened_reader.read(b"state", 100), Err(Error::Locked));
+});
+
+test_async!(
+    live_owner_reads_revoke_during_uncertain_or_cancelled_writes,
+    {
+        use futures::FutureExt;
+        for fault in [2, 3, 4] {
+            let mode = std::rc::Rc::new(std::cell::Cell::new(0));
+            let backend = Faults {
+                inner: Memory::new(),
+                mode: mode.clone(),
+            };
+            let key = cipher(1);
+            let mut store = Store::create(backend.clone(), &key, "s").await.unwrap();
+            store
+                .commit(0, [1; 32], &changes(b"before", b"before"), &[])
+                .await
+                .unwrap();
+            let reader = store.read_handle("wallet").unwrap();
+            mode.set(fault);
+            let changes = changes(b"after", b"after");
+            let mut pending = Box::pin(store.commit(1, [2; 32], &changes, &[]));
+            let outcome = pending.as_mut().now_or_never();
+            assert_eq!(
+                outcome,
+                match fault {
+                    2 => Some(Err(Error::Storage)),
+                    3 => Some(Err(Error::Uncertain)),
+                    _ => None,
+                }
+            );
+            // Polling may already have durably written bytes; until the real CAS
+            // returns success, neither those bytes nor the old snapshot is readable.
+            assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+            drop(pending);
+            assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+            assert_eq!(store.version(), Err(Error::Locked));
+            mode.set(0);
+            let reopened = Store::open(backend, &key, "s").await.unwrap();
+            let actual = reopened.read_handle("wallet").unwrap();
+            let expected = if fault == 2 {
+                b"before".as_slice()
+            } else {
+                b"after".as_slice()
+            };
+            assert_eq!(
+                actual.read(b"state", 100).unwrap().as_deref(),
+                Some(expected)
+            );
+            assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+        }
+    }
+);
+
+test_async!(
+    receipt_binds_scope_version_and_operation_of_the_current_checkpoint,
+    {
+        let key = cipher(1);
+        let mut store = Store::create(Memory::new(), &key, "community")
+            .await
+            .unwrap();
+        let receipt = store
+            .commit_with_receipt(0, [1; 32], &changes(b"a", b"b"), &[])
+            .await
+            .unwrap();
+        assert!(receipt.is_commit(&store, &[1; 32]));
+        // Another scope never adopts this receipt, even with the same key material.
+        let other = Store::create(Memory::new(), &key, "other-community")
+            .await
+            .unwrap();
+        assert!(!receipt.is_commit(&other, &[1; 32]));
+        // Committing the same operation identifier again moves the version fence.
+        store
+            .commit(1, [1; 32], &changes(b"c", b"d"), &[])
+            .await
+            .unwrap();
+        assert!(!receipt.is_commit(&store, &[1; 32]));
+    }
+);
+
+test_async!(
+    consuming_lock_wipes_the_state_and_leaves_the_backend_reopenable,
+    {
+        let backend = Memory::new();
+        let key = cipher(1);
+        let mut store = Store::create(backend.clone(), &key, "community")
+            .await
+            .unwrap();
+        store
+            .commit(0, [1; 32], &changes(b"a", b"b"), &[])
+            .await
+            .unwrap();
+        store.lock();
+        let reopened = Store::open(backend, &key, "community").await.unwrap();
+        assert_eq!(reopened.version().unwrap(), 1);
+    }
+);
+
+test_async!(
+    retained_compound_wire_restores_exact_owners_outputs_and_fences,
+    {
+        let key = cipher(7);
+        let source = Memory::new();
+        let mut original = Store::create(source.clone(), &key, "restore")
+            .await
+            .unwrap();
+        original
+            .commit(
+                0,
+                [41; 32],
+                &changes(b"wallet-original", b"threads-original"),
+                &[Output {
+                    id: [42; 32],
+                    bytes: b"outbox-original".to_vec(),
+                }],
+            )
+            .await
+            .unwrap();
+        let wire = original.sealed_checkpoint().unwrap().to_vec();
+        assert_eq!(source.read().await.unwrap().unwrap(), wire);
+        let destination = Memory::new();
+        let restored = Store::restore(destination.clone(), &key, "restore", 1, &wire)
+            .await
+            .unwrap();
+        assert_eq!(restored.sealed_checkpoint().unwrap(), wire);
+        assert_eq!(restored.operation().unwrap(), [41; 32]);
+        assert_eq!(
+            restored.read("wallet", b"state").unwrap().unwrap(),
+            b"wallet-original"
+        );
+        assert_eq!(
+            restored.read("threads", b"state").unwrap().unwrap(),
+            b"threads-original"
+        );
+        assert_eq!(
+            restored.load_pending().unwrap()[0].bytes,
+            b"outbox-original"
+        );
+        restored.lock();
+        assert_eq!(
+            Store::open(destination.clone(), &key, "restore")
+                .await
+                .unwrap()
+                .version()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            Store::restore(destination.clone(), &key, "restore", 1, &wire)
+                .await
+                .unwrap_err(),
+            Error::AlreadyInitialized
+        );
+        assert_eq!(destination.read().await.unwrap().unwrap(), wire);
+        for (scope, expected, bytes) in [
+            ("wrong", 1, wire.clone()),
+            ("restore", 0, wire.clone()),
+            ("restore", 1, {
+                let mut bad = wire.clone();
+                *bad.last_mut().unwrap() ^= 1;
+                bad
+            }),
+            ("restore", 1, vec![]),
+            ("restore", 1, vec![0; cwst::MAX_CHECKPOINT_BYTES + 1]),
+        ] {
+            let empty = Memory::new();
+            assert!(
+                Store::restore(empty.clone(), &key, scope, expected, &bytes)
+                    .await
+                    .is_err()
+            );
+            assert!(empty.read().await.unwrap().is_none());
+        }
+        let empty = Memory::new();
+        assert!(
+            Store::restore(empty.clone(), &cipher(8), "restore", 1, &wire)
+                .await
+                .is_err()
+        );
+        assert!(empty.read().await.unwrap().is_none());
+        original.lock_in_place();
+        assert_eq!(original.sealed_checkpoint(), Err(Error::Locked));
+    }
+);
+
+test_async!(
+    retained_restore_unknown_and_cancelled_cas_reopen_original_bytes,
+    {
+        use futures::FutureExt;
+        let key = cipher(7);
+        let original = Store::create(Memory::new(), &key, "restore").await.unwrap();
+        let wire = original.sealed_checkpoint().unwrap().to_vec();
+        for fault in [2, 3, 4] {
+            let mode = std::rc::Rc::new(std::cell::Cell::new(fault));
+            let backend = Faults {
+                inner: Memory::new(),
+                mode: mode.clone(),
+            };
+            let mut pending = Box::pin(Store::restore(backend.clone(), &key, "restore", 0, &wire));
+            match pending.as_mut().now_or_never() {
+                Some(Err(Error::Storage)) if fault == 2 => {}
+                Some(Err(Error::Uncertain)) if fault == 3 => {}
+                None if fault == 4 => {}
+                _ => panic!("unexpected restore outcome"),
+            }
+            drop(pending);
+            mode.set(0);
+            if fault == 2 {
+                assert!(backend.read().await.unwrap().is_none());
+            } else {
+                assert_eq!(
+                    Store::open(backend, &key, "restore")
+                        .await
+                        .unwrap()
+                        .sealed_checkpoint()
+                        .unwrap(),
+                    wire
+                );
+            }
+        }
+        let destination = Memory::new();
+        let (one, two) = futures::join!(
+            Store::restore(destination.clone(), &key, "restore", 0, &wire),
+            Store::restore(destination.clone(), &key, "restore", 0, &wire)
+        );
+        assert!(one.is_ok() ^ two.is_ok());
+        assert_eq!(one.err().or(two.err()).unwrap(), Error::AlreadyInitialized);
+    }
+);
+
+test_async!(
+    restore_checked_enforces_keys_digest_before_destination_cas,
+    {
+        #[derive(Clone)]
+        struct Counting {
+            inner: Memory,
+            writes: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Backend for Counting {
+            async fn read(&self) -> Result<Option<Vec<u8>>, Error> {
+                self.inner.read().await
+            }
+            async fn compare_exchange(
+                &self,
+                expected: Option<&[u8]>,
+                next: &[u8],
+            ) -> Result<(), Error> {
+                self.writes.set(self.writes.get() + 1);
+                self.inner.compare_exchange(expected, next).await
+            }
+        }
+        let key = cipher(7);
+        let mut original = Store::create(Memory::new(), &key, "restore").await.unwrap();
+        original
+            .commit(
+                0,
+                [41; 32],
+                &[
+                    Change::Put {
+                        owner: "keys",
+                        key: b"wraps",
+                        value: b"selected-keys",
+                    },
+                    Change::Put {
+                        owner: "wallet",
+                        key: b"state",
+                        value: b"wallet-original",
+                    },
+                ],
+                &[Output {
+                    id: [42; 32],
+                    bytes: b"outbox-original".to_vec(),
+                }],
+            )
+            .await
+            .unwrap();
+        let wire = original.sealed_checkpoint().unwrap().to_vec();
+        let expected = *blake3::hash(b"selected-keys").as_bytes();
+        let writes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let destination = Counting {
+            inner: Memory::new(),
+            writes: writes.clone(),
+        };
+        // Wrong expected Keys digest rejects before any destination CAS.
+        let wrong = *blake3::hash(b"other-keys").as_bytes();
+        assert_eq!(
+            Store::restore_checked(destination.clone(), &key, "restore", 1, &wire, |checked| {
+                let actual = checked.read("keys", b"wraps").unwrap().unwrap();
+                if blake3::hash(actual).as_bytes() != &wrong {
+                    return Err(Error::Invalid);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_err(),
+            Error::Invalid
+        );
+        assert!(destination.read().await.unwrap().is_none());
+        assert_eq!(writes.get(), 0);
+        // A checkpoint without the selected keys entry rejects the same way.
+        let mut bare = Store::create(Memory::new(), &key, "restore").await.unwrap();
+        bare.commit(0, [43; 32], &changes(b"wallet-only", b"threads-only"), &[])
+            .await
+            .unwrap();
+        let bare_wire = bare.sealed_checkpoint().unwrap().to_vec();
+        assert_eq!(
+            Store::restore_checked(
+                destination.clone(),
+                &key,
+                "restore",
+                1,
+                &bare_wire,
+                |checked| {
+                    if checked.read("keys", b"wraps").unwrap().is_none() {
+                        return Err(Error::Invalid);
+                    }
+                    Ok(())
+                }
+            )
+            .await
+            .unwrap_err(),
+            Error::Invalid
+        );
+        assert!(destination.read().await.unwrap().is_none());
+        assert_eq!(writes.get(), 0);
+        // The matching digest restores the exact version and bytes without overwrite.
+        let restored =
+            Store::restore_checked(destination.clone(), &key, "restore", 1, &wire, |checked| {
+                let actual = checked.read("keys", b"wraps").unwrap().unwrap();
+                if blake3::hash(actual).as_bytes() != &expected {
+                    return Err(Error::Invalid);
+                }
+                if checked.read("wallet", b"state").unwrap() != Some(b"wallet-original".as_slice())
+                {
+                    return Err(Error::Invalid);
+                }
+                let pending = checked.load_pending().unwrap();
+                if pending.len() != 1
+                    || pending[0].id != [42; 32]
+                    || pending[0].bytes.as_slice() != b"outbox-original".as_slice()
+                {
+                    return Err(Error::Invalid);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored.version().unwrap(), 1);
+        assert_eq!(restored.operation().unwrap(), [41; 32]);
+        assert_eq!(restored.sealed_checkpoint().unwrap(), wire);
+        assert_eq!(
+            restored.read("keys", b"wraps").unwrap(),
+            Some(b"selected-keys".as_slice())
+        );
+        assert_eq!(
+            restored.read("wallet", b"state").unwrap(),
+            Some(b"wallet-original".as_slice())
+        );
+        assert_eq!(
+            restored.load_pending().unwrap()[0].bytes,
+            b"outbox-original"
+        );
+        assert_eq!(destination.read().await.unwrap().unwrap(), wire);
+        assert_eq!(writes.get(), 1);
+        assert_eq!(
+            Store::restore_checked(destination.clone(), &key, "restore", 1, &wire, |_| Ok(()))
+                .await
+                .unwrap_err(),
+            Error::AlreadyInitialized
+        );
+        assert_eq!(destination.read().await.unwrap().unwrap(), wire);
+    }
+);
+
+test_async!(rewrap_commits_owner_changes_and_outbox_under_one_version, {
+    let backend = Memory::new();
+    let old_cipher = cipher(1);
+    let new_cipher = cipher(2);
+    let mut store = Store::create(backend.clone(), &old_cipher, "s")
+        .await
+        .unwrap();
+    let original_output = Output {
+        id: [1; 32],
+        bytes: b"already committed ciphertext".to_vec(),
+    };
+    let previous = store
+        .commit_with_receipt(
+            0,
+            [1; 32],
+            &changes(b"old wallet", b"retained conversation"),
+            std::slice::from_ref(&original_output),
+        )
+        .await
+        .unwrap();
+    let reader = store.read_handle("wallet").unwrap();
+    let new_output = Output {
+        id: [2; 32],
+        bytes: b"new committed ciphertext".to_vec(),
+    };
+    assert_eq!(
+        store
+            .commit_rewrapped(
+                1,
+                [2; 32],
+                &[
+                    Change::Put {
+                        owner: "wallet",
+                        key: b"state",
+                        value: b"new wallet",
+                    },
+                    Change::Put {
+                        owner: "keys",
+                        key: b"wraps",
+                        value: b"opaque owner transition",
+                    },
+                ],
+                std::slice::from_ref(&new_output),
+                &new_cipher,
+            )
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(store.operation().unwrap(), [2; 32]);
+    assert_eq!(
+        reader.read(b"state", 100).unwrap(),
+        Some(b"new wallet".to_vec())
+    );
+    assert!(!previous.is_commit(&store, &[1; 32]));
+    store.lock_in_place();
+    assert_eq!(
+        Store::open(backend.clone(), &old_cipher, "s")
+            .await
+            .unwrap_err(),
+        Error::Unlock
+    );
+    let mut reopened = Store::open(backend.clone(), &new_cipher, "s")
+        .await
+        .unwrap();
+    assert_eq!(reopened.version().unwrap(), 2);
+    assert_eq!(reopened.operation().unwrap(), [2; 32]);
+    assert_eq!(
+        reopened.read("wallet", b"state").unwrap(),
+        Some(b"new wallet".as_slice())
+    );
+    assert_eq!(
+        reopened.read("threads", b"state").unwrap(),
+        Some(b"retained conversation".as_slice())
+    );
+    assert_eq!(
+        reopened.read("keys", b"wraps").unwrap(),
+        Some(b"opaque owner transition".as_slice())
+    );
+    let pending = reopened.load_pending().unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].id, original_output.id);
+    assert_eq!(pending[0].bytes, original_output.bytes);
+    assert_eq!(pending[1].id, new_output.id);
+    assert_eq!(pending[1].bytes, new_output.bytes);
+    let receipt = reopened.receipt(&[2; 32]).unwrap();
+    assert!(receipt.is_commit(&reopened, &[2; 32]));
+    assert!(receipt.contains_record(
+        "keys",
+        b"wraps",
+        blake3::hash(b"opaque owner transition").as_bytes()
+    ));
+    assert!(receipt.contains_output(&new_output.id, blake3::hash(&new_output.bytes).as_bytes()));
+
+    // An ordinary subsequent commit must retain the new wrapper as well.
+    reopened
+        .ack_output(2, [3; 32], original_output.id)
+        .await
+        .unwrap();
+    reopened.lock();
+    let continued = Store::open(backend, &new_cipher, "s").await.unwrap();
+    assert_eq!(continued.version().unwrap(), 3);
+    assert_eq!(continued.load_pending().unwrap().len(), 1);
+    assert_eq!(continued.load_pending().unwrap()[0].bytes, new_output.bytes);
+});
+
+test_async!(rewrap_stale_backend_cas_preserves_the_winner, {
+    let backend = Memory::new();
+    let old_cipher = cipher(1);
+    let new_cipher = cipher(2);
+    let mut winner = Store::create(backend.clone(), &old_cipher, "s")
+        .await
+        .unwrap();
+    let mut stale = Store::open(backend.clone(), &old_cipher, "s")
+        .await
+        .unwrap();
+    let stale_reader = stale.read_handle("wallet").unwrap();
+    winner
+        .commit(0, [1; 32], &changes(b"winner", b"winner"), &[])
+        .await
+        .unwrap();
+    let winner_wire = backend.read().await.unwrap().unwrap();
+    // The expected version matches this handle: only the real backend CAS can
+    // reject the concurrent checkpoint, including the proposed new wrapper.
+    assert_eq!(stale.version().unwrap(), 0);
+    assert_eq!(
+        stale
+            .commit_rewrapped(0, [2; 32], &changes(b"loser", b"loser"), &[], &new_cipher)
+            .await
+            .unwrap_err(),
+        Error::Conflict
+    );
+    assert_eq!(stale.version(), Err(Error::Locked));
+    assert_eq!(stale_reader.read(b"state", 100), Err(Error::Locked));
+    assert_eq!(backend.read().await.unwrap().unwrap(), winner_wire);
+    assert_eq!(
+        Store::open(backend.clone(), &new_cipher, "s")
+            .await
+            .unwrap_err(),
+        Error::Unlock
+    );
+    let reopened = Store::open(backend, &old_cipher, "s").await.unwrap();
+    assert_eq!(reopened.version().unwrap(), 1);
+    assert_eq!(reopened.operation().unwrap(), [1; 32]);
+    assert_eq!(
+        reopened.read("wallet", b"state").unwrap(),
+        Some(b"winner".as_slice())
+    );
+});
+
+test_async!(
+    rewrap_failed_unknown_and_cancelled_writes_reconcile_one_wrapper,
+    {
+        use futures::FutureExt;
+        for fault in [2, 3, 4] {
+            let mode = std::rc::Rc::new(std::cell::Cell::new(0));
+            let backend = Faults {
+                inner: Memory::new(),
+                mode: mode.clone(),
+            };
+            let old_cipher = cipher(1);
+            let new_cipher = cipher(2);
+            let mut store = Store::create(backend.clone(), &old_cipher, "s")
+                .await
+                .unwrap();
+            let old_output = Output {
+                id: [1; 32],
+                bytes: b"retained output".to_vec(),
+            };
+            store
+                .commit(
+                    0,
+                    [1; 32],
+                    &changes(b"before", b"retained"),
+                    std::slice::from_ref(&old_output),
+                )
+                .await
+                .unwrap();
+            let original = backend.read().await.unwrap().unwrap();
+            let reader = store.read_handle("wallet").unwrap();
+            let changed = changes(b"after", b"retained");
+            let new_output = Output {
+                id: [2; 32],
+                bytes: b"new output".to_vec(),
+            };
+            mode.set(fault);
+            let mut pending = Box::pin(store.commit_rewrapped(
+                1,
+                [2; 32],
+                &changed,
+                std::slice::from_ref(&new_output),
+                &new_cipher,
+            ));
+            assert_eq!(
+                pending.as_mut().now_or_never(),
+                match fault {
+                    2 => Some(Err(Error::Storage)),
+                    3 => Some(Err(Error::Uncertain)),
+                    _ => None,
+                }
+            );
+            assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+            drop(pending);
+            assert_eq!(store.version(), Err(Error::Locked));
+            assert_eq!(store.receipt(&[2; 32]).unwrap_err(), Error::Locked);
+            mode.set(0);
+
+            let (accepted, refused, version, operation, wallet) = if fault == 2 {
+                assert_eq!(backend.read().await.unwrap().unwrap(), original);
+                (&old_cipher, &new_cipher, 1, [1; 32], b"before".as_slice())
+            } else {
+                assert_ne!(backend.read().await.unwrap().unwrap(), original);
+                (&new_cipher, &old_cipher, 2, [2; 32], b"after".as_slice())
+            };
+            assert_eq!(
+                Store::open(backend.clone(), refused, "s")
+                    .await
+                    .unwrap_err(),
+                Error::Unlock
+            );
+            let reopened = Store::open(backend, accepted, "s").await.unwrap();
+            assert_eq!(reopened.version().unwrap(), version);
+            assert_eq!(reopened.operation().unwrap(), operation);
+            assert_eq!(reopened.read("wallet", b"state").unwrap(), Some(wallet));
+            assert_eq!(
+                reopened.read("threads", b"state").unwrap(),
+                Some(b"retained".as_slice())
+            );
+            let outputs = reopened.load_pending().unwrap();
+            assert_eq!(outputs.len(), if fault == 2 { 1 } else { 2 });
+            assert_eq!(outputs[0].id, old_output.id);
+            assert_eq!(outputs[0].bytes, old_output.bytes);
+            if fault != 2 {
+                assert_eq!(outputs[1].id, new_output.id);
+                assert_eq!(outputs[1].bytes, new_output.bytes);
+                assert!(
+                    reopened.receipt(&operation).unwrap().contains_output(
+                        &new_output.id,
+                        blake3::hash(&new_output.bytes).as_bytes()
+                    )
+                );
+            }
+            assert_eq!(reader.read(b"state", 100), Err(Error::Locked));
+        }
+    }
+);
