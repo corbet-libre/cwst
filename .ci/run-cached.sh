@@ -36,6 +36,20 @@ ln -s "$state/moon-cache/outputs" .moon/cache/outputs
 tool_source=github:NixOS/nixpkgs/b7c2ada94fe99c15b0dbcf4d11fd7850b957a436
 tool_paths=$(nix build --no-link --print-out-paths "$tool_source#moon" "$tool_source#proto" "$tool_source#nodejs_24" "$tool_source#curl" "$tool_source#wasm-pack" "$tool_source#clang" "$tool_source#chromedriver" "$tool_source#chromium" "$tool_source#cargo-llvm-cov")
 for path in $tool_paths; do PATH="$path/bin:$PATH"; done
+# minicov's build script hardcodes `clang`, so every wasm32 C build uses
+# whatever `clang` resolves on PATH (currently the x86_64 nix wrapper, which
+# breaks on host glibc headers). Resolve the pinned unwrapped compiler here
+# (actual closure path from Nix at runtime, never a hardcoded store path) and
+# export it for the cache fingerprint + the wasm legs in verify.sh. It stays
+# off the global PATH so native builds and nightly coverage keep the wrapper.
+CWST_WASM_CLANG_BIN=""
+for out in $(nix build --no-link --print-out-paths "$tool_source#llvmPackages.clang-unwrapped"); do
+  if [ -x "$out/bin/clang" ]; then CWST_WASM_CLANG_BIN="$out/bin"; fi
+done
+test -n "$CWST_WASM_CLANG_BIN" || { echo 'pinned unwrapped clang provides no bin/clang' >&2; exit 2; }
+export CWST_WASM_CLANG_BIN
+export CWST_WASM_CLANG="$CWST_WASM_CLANG_BIN/clang"
+"$CWST_WASM_CLANG" --version
 # requirements.txt pins `selenium>=4.49.0`; supply a pinned python env with
 # selenium plus its transitive deps (urllib3/trio/websocket-client/
 # certifi/…) and pip (probe + CI pip fallback) so the gate needs no PyPI round

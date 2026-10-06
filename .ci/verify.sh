@@ -28,8 +28,16 @@ cargo test --locked
 # failed run, so keep the merge here (same commands and flags) to keep the
 # next failure diagnosable.
 echo 'stage: wasm clippy+vectors'
+# The nix wrapper `clang` on PATH breaks the wasm32 C build (host glibc
+# headers, minicov hardcodes `clang`); resolve `clang` to the pinned
+# unwrapped compiler for this leg only: the subshell keeps native builds
+# and nightly coverage on the wrapper.
+: "${CWST_WASM_CLANG_BIN:?Missing unwrapped wasm clang from run-cached.sh}"
+(
+export PATH="$CWST_WASM_CLANG_BIN:$PATH"
 cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings 2>&1
 wasm-pack test --headless --chrome -- --locked -- --nocapture 2>&1
+)
 
 # coverage gate (ci.yml coverage job, nightly branch instrumentation).
 # Product builds stay on stable; only this gate uses nightly.
@@ -42,6 +50,15 @@ export CARGO="$NIGHTLY_CARGO"
 export PATH="$NIGHTLY_BIN:$PATH"
 export RUSTUP_TOOLCHAIN=nightly
 "$NIGHTLY_CARGO" llvm-cov --version
+# Bug 2 isolation: coverage data must not reuse the shared cargo target
+# across jobs (stale checkout paths fail the next gate); scope the
+# coverage target to this job only. Native gates keep the shared warm
+# target; outer traps and services are untouched.
+(
+coverage_target="$(mktemp -d)"
+case "$coverage_target" in ""|"$PWD"/*) echo 'unsafe coverage target' >&2; exit 2;; esac
+trap 'rm -rf -- "$coverage_target"' EXIT
+export CARGO_TARGET_DIR="$coverage_target"
 "$NIGHTLY_CARGO" llvm-cov --locked --branch --json --output-path coverage.json --ignore-filename-regex '/tests/'
 "$NIGHTLY_CARGO" llvm-cov report --lcov --output-path coverage.lcov --ignore-filename-regex '/tests/'
 "$NIGHTLY_CARGO" llvm-cov report --text --output-path coverage.txt --ignore-filename-regex '/tests/'
@@ -120,10 +137,15 @@ export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="python3 $runner_copy"
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-Zno-profiler-runtime -Clink-args=--no-gc-sections --cfg=owned_browser_coverage"
 export WASM_BINDGEN_TEST_ONLY_WEB="1"
 export WASM_BINDGEN_SPLIT_LINKED_MODULES="1"
-export CC_wasm32_unknown_unknown=clang
+export CC_wasm32_unknown_unknown="$CWST_WASM_CLANG"
+: "${CWST_WASM_CLANG_BIN:?Missing unwrapped wasm clang from run-cached.sh}"
+(
+export PATH="$CWST_WASM_CLANG_BIN:$PATH"
 "$NIGHTLY_CARGO" llvm-cov test --locked --branch --coverage-target-only --target wasm32-unknown-unknown --json --output-path wasm-coverage.json --ignore-filename-regex '/tests/'
+)
 "$NIGHTLY_CARGO" llvm-cov report --target wasm32-unknown-unknown --lcov --output-path wasm-coverage.lcov --ignore-filename-regex '/tests/'
 "$NIGHTLY_CARGO" llvm-cov report --target wasm32-unknown-unknown --text --output-path wasm-coverage.txt --ignore-filename-regex '/tests/'
+)
 python3 .github/scripts/check-coverage.py wasm-coverage.lcov wasm-coverage.json wasm-coverage.txt wasm
 
 # browser-coverage gate (ci.yml browser-coverage job). No toolchain: plain npm.
