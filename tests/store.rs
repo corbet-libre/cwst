@@ -492,6 +492,128 @@ test_async!(compound_limits_and_replacements, {
 
 #[cfg(unix)]
 #[test]
+fn native_dangling_checkpoint_is_not_absence() {
+    futures_executor::block_on(async {
+        for target in ["missing-checkpoint", "missing-parent/checkpoint"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("checkpoint");
+            std::os::unix::fs::symlink(target, &path).unwrap();
+            let backend = cwst::native::FileBackend::new(dir.path());
+            let key = cipher(1);
+            let assert_unchanged = || {
+                assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+                assert_eq!(
+                    std::fs::read_link(&path).unwrap(),
+                    std::path::Path::new(target)
+                );
+                assert_eq!(
+                    std::fs::symlink_metadata(dir.path().join(target))
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                if target.starts_with("missing-parent/") {
+                    assert_eq!(
+                        std::fs::symlink_metadata(dir.path().join("missing-parent"))
+                            .unwrap_err()
+                            .kind(),
+                        std::io::ErrorKind::NotFound
+                    );
+                }
+            };
+
+            assert_eq!(backend.read().await.unwrap_err(), Error::Storage);
+            assert_unchanged();
+            assert_eq!(
+                Store::open(backend.clone(), &key, "community")
+                    .await
+                    .unwrap_err(),
+                Error::Storage
+            );
+            assert_unchanged();
+            assert_eq!(
+                Store::create(backend.clone(), &key, "community")
+                    .await
+                    .unwrap_err(),
+                Error::Storage
+            );
+            assert_unchanged();
+            assert_eq!(
+                backend
+                    .compare_exchange(None, b"replacement")
+                    .await
+                    .unwrap_err(),
+                Error::Storage
+            );
+            assert_unchanged();
+
+            // Only explicit removal of the unreadable entry permits initialization.
+            std::fs::remove_file(&path).unwrap();
+            let store = Store::create(backend.clone(), &key, "community")
+                .await
+                .unwrap();
+            assert_eq!(store.version().unwrap(), 0);
+            assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+            assert_eq!(
+                Store::open(backend, &key, "community")
+                    .await
+                    .unwrap()
+                    .version()
+                    .unwrap(),
+                0
+            );
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn native_absent_checkpoint_allows_initialization() {
+    futures_executor::block_on(async {
+        for through_symlink in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let directory = dir.path().join("store");
+            std::fs::create_dir(&directory).unwrap();
+            let alias = dir.path().join("store-alias");
+            let backend = if through_symlink {
+                std::os::unix::fs::symlink(&directory, &alias).unwrap();
+                cwst::native::FileBackend::new(&alias)
+            } else {
+                cwst::native::FileBackend::new(&directory)
+            };
+            let key = cipher(1);
+            assert!(backend.read().await.unwrap().is_none());
+            assert_eq!(
+                Store::open(backend.clone(), &key, "community")
+                    .await
+                    .unwrap_err(),
+                Error::NotInitialized
+            );
+            let store = Store::create(backend.clone(), &key, "community")
+                .await
+                .unwrap();
+            assert_eq!(store.version().unwrap(), 0);
+            let checkpoint = backend.read().await.unwrap().unwrap();
+
+            let cas_directory = dir.path().join("cas-store");
+            std::fs::create_dir(&cas_directory).unwrap();
+            let cas = cwst::native::FileBackend::new(&cas_directory);
+            cas.compare_exchange(None, &checkpoint).await.unwrap();
+            assert_eq!(cas.read().await.unwrap().unwrap(), checkpoint);
+            assert_eq!(
+                Store::open(cas, &key, "community")
+                    .await
+                    .unwrap()
+                    .version()
+                    .unwrap(),
+                0
+            );
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn native_unreadable_and_oversized_files() {
     futures_executor::block_on(async {
         let dir = tempfile::tempdir().unwrap();
