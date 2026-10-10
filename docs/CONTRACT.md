@@ -34,6 +34,7 @@ buffers are wiped on drop where owned by this library. Callers must wipe their
 copies. Error/Debug values carry no identifiers, paths, contents or upstream errors.
 
 Absence differs from unreadability, corruption and wrong wrapping capability.
+An existing checkpoint entry with a missing symlink target is unreadable, not absent.
 Explicit `create` is a local storage operation, never a new membership or a restore
 verdict. Trusted storage cannot detect an adversary replacing an entire device
 filesystem with an old valid snapshot after all external revision anchors are lost.

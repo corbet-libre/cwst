@@ -39,7 +39,13 @@ impl FileBackend {
     fn load(&self) -> Result<Option<Vec<u8>>, Error> {
         let file = match File::open(&self.path) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Opening follows symlinks; a missing target is not an absent checkpoint.
+                return match std::fs::symlink_metadata(&self.path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    _ => Err(Error::Storage),
+                };
+            }
             Err(_) => return Err(Error::Storage),
         };
         let mut bytes = Vec::new();
