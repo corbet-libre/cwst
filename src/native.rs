@@ -37,17 +37,13 @@ impl FileBackend {
         Ok(file)
     }
     fn load(&self) -> Result<Option<Vec<u8>>, Error> {
-        let file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Opening follows symlinks; a missing target is not an absent checkpoint.
-                return match std::fs::symlink_metadata(&self.path) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    _ => Err(Error::Storage),
-                };
-            }
+        // Check the entry without following symlinks; only a missing entry is absent.
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(Error::Storage),
-        };
+        }
+        let file = File::open(&self.path).map_err(|_| Error::Storage)?;
         let mut bytes = Vec::new();
         file.take(MAX_CHECKPOINT_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
@@ -75,3 +71,7 @@ impl Backend for FileBackend {
             .map_err(|_| Error::Uncertain)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/native.rs"]
+mod tests;
