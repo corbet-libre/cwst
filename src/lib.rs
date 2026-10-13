@@ -10,7 +10,7 @@ mod store;
 mod veilid_crypt;
 
 pub use error::Error;
-pub use store::{Change, Output, Store};
+pub use store::{Change, CommitReceipt, Output, ReadHandle, Store};
 /// Maximum encrypted checkpoint size, including all owners and pending outputs.
 pub const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum individual opaque value or output.

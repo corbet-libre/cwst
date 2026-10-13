@@ -44,3 +44,55 @@ No operator backup or recovery surface exists here.
 
 The former password-based development layout is intentionally replaced without a
 migration path. `veilid_crypt.rs` retains its MPL-2.0 header and modification record.
+
+## Compound commit receipts
+
+`commit_with_receipt` performs the existing atomic commit and returns a constructor-private
+`CommitReceipt`. `receipt(operation)` reconstitutes one only from the authenticated
+current checkpoint after reopen. Locked, uncertain, or mismatched operations refuse.
+The receipt has no Clone/serde and binds the encrypted store identity, scope, version,
+operation, and final stored record/outbox bytes via BLAKE3. `is_commit(&store, &operation)`
+refuses another store with the same scope or a newer in-memory checkpoint. It does not
+claim that an independently changed backend is unchanged: the next write still needs
+Storage's actual CAS. `contains_record`/`contains_output` compare exact owner candidate
+digests, so transient mutations overwritten/deleted later in a batch cannot authorize
+adoption. Wallet must require its exact operation, expected next version, and all
+candidate/output digests, then consume the receipt when adopting. Storage proves
+persistence only; issuer/domain acceptance remains the owner's obligation.
+
+Records retention borrows only `Store::sealed_checkpoint`, the exact authenticated
+ciphertext already durably held by the original Store. It exposes neither owner
+plaintext nor a root/wrapping key and is not a user backup/export format.
+`Store::restore` validates that same original framing, scope, wrapping AEAD,
+checkpoint schema and expected version before its first write. It uses only
+`Backend::compare_exchange(None, wire)`: an existing local checkpoint, even an
+identical one, is never overwritten. A conflict is AlreadyInitialized. Interrupted
+or uncertain CAS may have persisted the exact bytes, so the caller reopens the
+original destination to reconcile. Storage never attests network freshness,
+current passkey/lineage, available replicas or application readiness.
+
+## Atomic wrapping changes
+
+`commit_rewrapped(expected, operation, changes, outputs, cipher)` performs the
+same bounded owner/outbox commit while wrapping the existing random data key
+with the supplied opaque StoreCipher. It advances the checkpoint version exactly
+once. The new wrapper is authenticated with the complete new ciphertext and both
+replace the exact encrypted predecessor in the same backend CAS. Unchanged owner
+records and pending outputs remain; no intermediate wrapper-only write exists.
+Later ordinary commits keep the replacement wrapper. Reopening the replacement
+requires its new capability; substituting a valid old wrapper into the new
+ciphertext, or a valid new wrapper into the old ciphertext, is refused.
+
+The normal commit fences and failure rules also apply: validation and encryption
+complete before persistence; once a write is attempted, conflict, error or
+cancellation leaves the handle and its ReadHandles locked. An uncertain or
+cancelled write may have persisted the whole replacement, including the wrapper.
+Reopen the appropriate owner-authorized capability and reconcile the authenticated
+operation, version and pending outputs before any publication or retry. Store
+does not automatically try a second capability. `receipt(operation)` can recover
+the existing compound commit receipt after successful rewrap or authenticated
+reopen; a failed or locked handle provides no receipt.
+
+This primitive supports an explicit owner-directed wrapping migration. Store
+neither derives a root/PRF nor chooses a root epoch, validates membership, retains
+obsolete capabilities, resets versions or migrates old formats implicitly.
