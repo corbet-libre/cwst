@@ -10,7 +10,7 @@ No own cryptographic primitives or veilid-core dependency. Preserve the MPL-2.0
 header in src/veilid_crypt.rs and record every modification; other code is
 LGPL-3.0-only WITH LGPL-3.0-linking-exception. No GPL-only/AGPL additions.
 
-No workstation Cargo, including fmt/metadata. Public CI runs format, native and
+No local Cargo, including fmt/metadata. Public CI runs format, native and
 wasm Clippy, real native/browser tests, and 100% reachable line/branch coverage.
 First-party dependencies use branch main with one revision each in Cargo.lock.
 No registry publication. Explicit-path staging, plain-English commits, no AI credit.
