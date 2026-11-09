@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Encrypted atomic device checkpoints with durable outbox and writer fencing"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception AND MPL-2.0"
-repository = "https://git.corbet.ch/corbet-foss/cwst"
+repository = "https://git.corbet.ch/corbet-foss/cwst.git"
 readme = "README.md"
 publish = false
 include = [
@@ -31,7 +31,7 @@ blake3 = "1.8"
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 getrandom = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
-ckmg = { git = "https://git.corbet.ch/corbet-foss/ckmg", branch = "main" }
+ckmg = { git = "https://git.corbet.ch/corbet-libre/ckmg.git", branch = "main" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
