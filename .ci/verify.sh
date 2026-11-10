@@ -18,7 +18,6 @@ python3 .github/scripts/test-lock.py
 node --test .github/scripts/test-auto-merge.mjs
 python3 .github/scripts/test-coverage.py
 rustc --version --verbose
-bash .ci/update-our-crates.sh
 cargo fmt --all -- --check || { cargo fmt --all; git diff > formatting.patch; exit 1; }
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
