@@ -122,6 +122,28 @@ fn entropy_failures_refuse_creation_and_data_encryption() {
     });
 }
 
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn entropy_failure_refuses_rewrapping_without_publishing() {
+    futures_executor::block_on(async {
+        let cipher = store_cipher(&PrfOutput::from_bytes(&[4; 32]).unwrap(), "test").unwrap();
+        let backend = Memory::new();
+        let mut store = Store::create(backend.clone(), &cipher, "test")
+            .await
+            .unwrap();
+        let before = backend.read().await.unwrap().unwrap();
+        let version = store.version().unwrap();
+        assert_eq!(
+            store
+                .commit_wrapping(version, [1; 32], &[], &[], Some(&cipher), &mut FailAfter(0))
+                .await
+                .unwrap_err(),
+            Error::Crypto
+        );
+        assert_eq!(backend.read().await.unwrap().unwrap(), before);
+    });
+}
+
 #[cfg(all(target_arch = "wasm32", owned_browser_coverage))]
 #[wasm_bindgen_test::wasm_bindgen_test]
 fn profiling_runtime_is_linked() {

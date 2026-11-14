@@ -388,8 +388,15 @@ impl<B: Backend> Store<B> {
         changes: &[Change<'_>],
         outputs: &[Output],
     ) -> Result<u64, Error> {
-        self.commit_wrapping(expected, operation, changes, outputs, None)
-            .await
+        self.commit_wrapping(
+            expected,
+            operation,
+            changes,
+            outputs,
+            None,
+            &mut ckmg::SystemEntropy,
+        )
+        .await
     }
     /// Commit owner changes and rewrap the same random data key in one CAS.
     /// The new wrapper is authenticated with the entire replacement checkpoint.
@@ -403,8 +410,15 @@ impl<B: Backend> Store<B> {
         outputs: &[Output],
         cipher: &StoreCipher,
     ) -> Result<u64, Error> {
-        self.commit_wrapping(expected, operation, changes, outputs, Some(cipher))
-            .await
+        self.commit_wrapping(
+            expected,
+            operation,
+            changes,
+            outputs,
+            Some(cipher),
+            &mut ckmg::SystemEntropy,
+        )
+        .await
     }
     async fn commit_wrapping(
         &mut self,
@@ -413,6 +427,7 @@ impl<B: Backend> Store<B> {
         changes: &[Change<'_>],
         outputs: &[Output],
         cipher: Option<&StoreCipher>,
+        entropy: &mut impl ckmg::Entropy,
     ) -> Result<u64, Error> {
         self.expect(expected)?;
         if changes.len() > MAX_RECORDS || outputs.len() > MAX_OUTPUTS || operation == [0; 32] {
@@ -459,7 +474,8 @@ impl<B: Backend> Store<B> {
             }
         }
         candidate.pending.extend_from_slice(outputs);
-        self.save_wrapping(candidate, operation, cipher).await
+        self.save_wrapping(candidate, operation, cipher, entropy)
+            .await
     }
     /// Acknowledge one exact output after its idempotent publication.
     pub async fn ack_output(
@@ -500,13 +516,15 @@ impl<B: Backend> Store<B> {
         }
     }
     async fn save(&mut self, candidate: Checkpoint, operation: [u8; 32]) -> Result<u64, Error> {
-        self.save_wrapping(candidate, operation, None).await
+        self.save_wrapping(candidate, operation, None, &mut ckmg::SystemEntropy)
+            .await
     }
     async fn save_wrapping(
         &mut self,
         mut candidate: Checkpoint,
         operation: [u8; 32],
         cipher: Option<&StoreCipher>,
+        entropy: &mut impl ckmg::Entropy,
     ) -> Result<u64, Error> {
         candidate.version = candidate.version.checked_add(1).ok_or(Error::TooLarge)?;
         candidate.operation = operation;
@@ -514,11 +532,7 @@ impl<B: Backend> Store<B> {
         let current = self.current()?;
         let wrapped = match cipher {
             Some(cipher) => cipher
-                .seal(
-                    &mut ckmg::SystemEntropy,
-                    &self.context,
-                    current.key.as_slice(),
-                )
+                .seal(entropy, &self.context, current.key.as_slice())
                 .map_err(|_| Error::Crypto)?,
             None => current.wrapped.clone(),
         };
