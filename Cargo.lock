@@ -120,7 +120,7 @@ dependencies = [
 [[package]]
 name = "cdht"
 version = "0.0.0"
-source = "git+https://git.corbet.ch/corbet-libre/cdht.git?branch=main#0e13b99c42391d87ebc00d85ce0bf40631247a41"
+source = "git+https://git.corbet.ch/corbet-libre/cdht.git?branch=main#76d78fb067a4b5318bf9c6228a29a45bb071ec1a"
 dependencies = [
  "blake3",
  "capnp",
@@ -179,7 +179,7 @@ dependencies = [
 [[package]]
 name = "ckmg"
 version = "0.0.0"
-source = "git+https://git.corbet.ch/corbet-libre/ckmg.git?branch=main#4c7ed0122f25c92f185a7c84472a891764ed2207"
+source = "git+https://git.corbet.ch/corbet-libre/ckmg.git?branch=main#cf4a1fbb69b1f18f3962ec2a3ed74c6e02bd979a"
 dependencies = [
  "blake3",
  "cdht",
