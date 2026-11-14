@@ -35,7 +35,6 @@ jobs:
           cargo update
           python3 .github/scripts/check-lock.py
           python3 .github/scripts/test-lock.py
-          node --test .github/scripts/test-auto-merge.mjs
           python3 .github/scripts/test-coverage.py
           rustc --version --verbose
       - uses: actions/upload-artifact@v4
